@@ -2,8 +2,9 @@ package={name= 'kms', version= '0.0.0', edition= '2021'}
 bin=[{name='kms',path= 'main.rs'}]
 
 [dependencies]
-drm='*'
 bytemuck='*'
+drm='*'
+ffmpeg = {package='ffmpeg-next', version='*'}
 
 [patch.'crates-io']
 drm={path='../drm-rs'}
