@@ -3,10 +3,11 @@ bin=[{name='kms',path= 'main.rs'}]
 
 [dependencies]
 bytemuck='*'
-drm='*'
-ffmpeg ={package='ffmpeg-next', version='*'}
+nom='*'
+memmap='*'
+matroska={version='*', git='https://github.com/rust-av/matroska'}
+#drm='*'
 va={package='libva-sys',version='*'}
 
 [patch.'crates-io']
-drm={path='../drm-rs'}
 libva-sys={git='https://github.com/vgarleanu/libva-sys', commit='f5d78be'}
