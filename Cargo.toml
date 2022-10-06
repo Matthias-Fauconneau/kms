@@ -4,7 +4,9 @@ bin=[{name='kms',path= 'main.rs'}]
 [dependencies]
 bytemuck='*'
 drm='*'
-ffmpeg = {package='ffmpeg-next', version='*'}
+ffmpeg ={package='ffmpeg-next', version='*'}
+va={package='libva-sys',version='*'}
 
 [patch.'crates-io']
 drm={path='../drm-rs'}
+libva-sys={git='https://github.com/vgarleanu/libva-sys', commit='f5d78be'}
