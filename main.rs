@@ -54,6 +54,7 @@ fn profile_tier_level(s: &mut BitReader, max_layers: usize) {
         });
     }
 }
+
 #[derive(Default,Clone,Copy)] struct LayerOrdering { max_dec_pic_buffering: u8, num_reorder_pics: u8, max_latency_increase: u8 }
 fn layer_ordering(s: &mut BitReader, max_layers: usize) -> Box<[LayerOrdering]> {
     (0 .. (if s.bit() { max_layers } else { 1 })).map(|_| LayerOrdering{
@@ -341,6 +342,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             let _temporal_id_nesting = s.bit();
                             assert!(s.u16() == 0xFFFF);
                             profile_tier_level(s, max_layers);
+                            layer_ordering(s, max_layers);
                             let max_layer_id = s.bits(6);
                             let num_layer_sets = s.ue() + 1;
                             for _ in 1..num_layer_sets {
@@ -352,7 +354,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                 let _num_units_in_tick = s.u32();
                                 let _time_scale = s.u32();
                                 if s.bit() { let _num_ticks_poc_diff_one = s.ue() + 1; }
-                                (0..s.ue()).map(|i| { let _hrd_layer_set_index = s.ue(); let bit = s.bit(); hrd_parameters(s, i > 0 && bit, max_layers) }).count();
+                                (0..s.ue()).map(|i| { let _hrd_layer_set_index = s.ue(); let common_inf = i>0 && s.bit(); hrd_parameters(s, common_inf, max_layers) }).count();
                             }
                             s.bit(); // vps_extension
                             vps[id] = Some(VPS{});
@@ -553,7 +555,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                 } else { (None, None) };
                                 if first_slice_in_pic {
                                     let mut buffer = 0; //VABufferID
-                                    check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VAPictureParameterBufferType, std::mem::size_of::<va::VAPictureParameterBufferHEVC> as u32, 1,
+                                    check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VAPictureParameterBufferType, std::mem::size_of::<va::VAPictureParameterBufferHEVC>() as std::ffi::c_uint, 1,
                                         &mut va::VAPictureParameterBufferHEVC{
                                             pic_width_in_luma_samples: sps.width,
                                             pic_height_in_luma_samples: sps.height,

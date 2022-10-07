@@ -22,7 +22,7 @@ impl<'t> BitReader<'t> {
         self.count |= 56;
     }
     fn peek(&self, count: u8) -> u64 { unsafe { self.word.unchecked_shr(64 - count as u64) } }
-    pub fn advance(&mut self, count: u8) { self.word <<= count; self.count -= count; }
+    #[track_caller] pub fn advance(&mut self, count: u8) { self.word <<= count; assert!(count <= self.count, "{count} {}", self.count); self.count -= count; }
     #[track_caller] pub fn bits(&mut self, count: u8) -> u64 {
         if count > self.count { unsafe { self.refill(); } }
         let result = self.peek(count);
@@ -33,7 +33,7 @@ impl<'t> BitReader<'t> {
     pub fn u8(&mut self) -> u8 { self.bits(8) as u8 }
     pub fn u16(&mut self) -> u16 { self.bits(16) as u16 }
     pub fn u32(&mut self) -> u32 { self.bits(32) as u32 }
-    pub fn ue(&mut self) -> u64 { // Exp-Golomb
+    #[track_caller] pub fn ue(&mut self) -> u64 { // Exp-Golomb
         unsafe { self.refill(); }
         let count = self.word.leading_zeros() as u8;
         self.advance(count);
