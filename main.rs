@@ -21,7 +21,6 @@ pub const TRAIL_N: u8 = 0;
 mod bit; use bit::BitReader;
 
 fn profile_tier_level(s: &mut BitReader, max_layers: usize) {
-    assert!(s.available(88));
     let _profile_space = s.bits(2);
     let _tier = s.bit();
     let profile = s.bits(5);
@@ -46,7 +45,6 @@ fn profile_tier_level(s: &mut BitReader, max_layers: usize) {
         s.bits(34);*/
     s.bits(44);
     let _level_idc = s.u8();
-    println!("{max_layers} {_level_idc}");
     if max_layers > 1 {
         let layers : [_; 8] = std::array::from_fn(|_| (s.bit(), s.bit()));
         println!("{layers:?}");
@@ -127,7 +125,7 @@ fn scaling_list(s: &mut BitReader) {
 }
 
 struct VPS {}
-struct ShortTermReferencePicture { delta_poc: i8, used: bool }
+#[derive(Clone,Debug)] struct ShortTermReferencePicture { delta_poc: i8, used: bool }
 struct LongTermReferencePicture { poc_lsb_sps: u8, used: bool } // _by_curr_pic_sps
 struct PulseCodeModulation { bit_depth: u8, bit_depth_chroma: u8, log2_min_coding_block_size: u8, log2_diff_max_min_coding_block_size: u8, loop_filter_disable: bool }
 
@@ -187,6 +185,24 @@ struct PPS {
     pps_extension: bool
 }
 
+fn decode_short_term_reference_picture_set(s: &mut BitReader, sets: &[Box<[ShortTermReferencePicture]>]) -> Box<[ShortTermReferencePicture]> {
+    if !sets.is_empty() && /*predict*/s.bit() {
+        //let ref _reference = sets[sets.len()-1-(if is_last { s.ue() as usize } else { 0 })];
+        let ref _set = &sets[sets.len()-1-s.ue() as usize];
+        let _delta = if s.bit() { -1 } else { 1 } * (s.ue()+1) as i8;
+        //let mut parse = |(reference,_)| { let used = s.bit(); if used || s.bit() { Some((reference+delta, used)) } else { None } };
+        unimplemented!()//set.iter().filter_map(parse).chain(std::iter::once(parse((0,false)))).collect()
+    } else {
+        let negative = s.ue() as usize;
+        let positive = s.ue() as usize;
+        let mut set = Vec::with_capacity(negative+positive);
+        use std::iter::successors; type P = ShortTermReferencePicture;
+        set.extend(successors(Some(P{delta_poc:0,used:false}), |P{delta_poc,..}| Some(P{delta_poc: delta_poc -1 -s.ue() as i8, used: s.bit()})).take(negative));
+        set.extend(successors(Some(P{delta_poc:0,used:false}), |P{delta_poc,..}| Some(P{delta_poc: delta_poc+1+s.ue() as i8, used: s.bit()})).take(positive));
+        set.into_boxed_slice()
+    }
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().skip(1).next().unwrap_or(std::env::var("HOME")?+"/input.mkv");
     let input = unsafe{memmap::Mmap::map(&std::fs::File::open(path)?)}?;
@@ -205,7 +221,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let card = Card(std::fs::OpenOptions::new().read(true).write(true).open("/dev/dri/card0").unwrap());
     impl std::os::unix::io::AsRawFd for Card { fn as_raw_fd(&self) -> std::os::unix::io::RawFd { self.0.as_raw_fd() } }
     use std::os::unix::io::AsRawFd;
-    let va = unsafe{va::va_display_drm::vaGetDisplayDRM(card.0.as_raw_fd())};
+    use va::va_display_drm::*;
+    let va = unsafe{vaGetDisplayDRM(card.0.as_raw_fd())};
     #[repr(C)] struct AVVAAPIDeviceContext { display: va::VADisplay, driver_quirks: std::ffi::c_uint }
     extern "C" fn error(_user_context: *mut std::ffi::c_void, message: *const std::ffi::c_char) { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(message)}) }
     unsafe{va::vaSetErrorCallback(va, Some(error), std::ptr::null_mut())};
@@ -218,16 +235,17 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut len = profiles.capacity() as i32;
     check(unsafe{va::vaQueryConfigProfiles(va, profiles.as_mut_ptr(), &mut len)});
     unsafe{profiles.set_len(len as usize)};
-    let (profile, entrypoint) = profiles.into_iter().find_map(|profile| (profile /* != va::va_display::VAProfile_VAProfileNone*/== va::va_display::VAProfile_VAProfileHEVCMain10).then(||{
+    let (profile, entrypoint) = profiles.into_iter().find_map(|profile| (profile /* != VAProfile_VAProfileNone*/== VAProfile_VAProfileHEVCMain10).then(||{
         let mut entrypoints = Vec::with_capacity(unsafe{va::vaMaxNumEntrypoints(va)} as usize);
         let mut len = entrypoints.capacity() as i32;
         check(unsafe{va::vaQueryConfigEntrypoints(va, profile, entrypoints.as_mut_ptr(), &mut len)});
         unsafe{entrypoints.set_len(len as usize)};
-        (profile, entrypoints.into_iter().find(|&entrypoint| entrypoint == va::va_display::VAEntrypoint_VAEntrypointVLD).unwrap())
+        (profile, entrypoints.into_iter().find(|&entrypoint| entrypoint == VAEntrypoint_VAEntrypointVLD).unwrap())
     })).unwrap();
     let mut config = 0; // va::VAConfigID
     check(unsafe{va::vaCreateConfig(va, profile, entrypoint, std::ptr::null_mut(), 0, &mut config)});
-    let mut render_targets = [0; 1];
+    let mut surfaces = [0; 1];
+    let mut context = 0;
 
     let mut parse_nal = |data| {
                     pub fn clear_start_code_emulation_prevention_3_byte(data: &[u8]) -> Vec<u8> {
@@ -330,7 +348,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             let _temporal_id_nesting = s.bit();
                             profile_tier_level(s, max_layers);
                             let id = s.ue() as usize;
-                            println!("SPS {id}");
                             assert!(id < sps.len(), "{id}");
                             let chroma_format_idc = s.ue() as u8;
                             let separate_colour_plane = if chroma_format_idc == 3 { s.bit() } else { false };
@@ -338,10 +355,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             let width = s.ue() as u16;
                             let height = s.ue() as u16;
 
-                            check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_YUV420_10, width as _, height as _, render_targets.as_mut_ptr(), render_targets.len() as _, std::ptr::null_mut(), 0)});
+                            check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_YUV420_10, width as _, height as _, surfaces.as_mut_ptr(), surfaces.len() as _, std::ptr::null_mut(), 0)});
+                            check(unsafe{va::vaCreateContext(va, config, width as _, height as _, va::VA_PROGRESSIVE as _, surfaces.as_mut_ptr(), surfaces.len() as _, &mut context)});
 
                             if s.bit() { let (_left, _right, _top, _bottom) = (s.ue(), s.ue(), s.ue(), s.ue()); }
                             let bit_depth = 8 + s.ue() as u8;
+                            assert!(bit_depth == 10);
                             let _bit_depth_chroma = 8 + s.ue() as u8;
                             let log2_max_poc_lsb = 4 + s.ue() as u8;
                             let layer_ordering = layer_ordering(s, max_layers);
@@ -362,27 +381,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                 loop_filter_disable: s.bit()
                             });
                             let short_term_reference_picture_sets = {
-                                let mut rps = Vec::<Box<[ShortTermReferencePicture]>>::with_capacity(s.ue() as usize);
-                                for i in 0..rps.capacity() {
-                                    let e = if i > 0 && s.bit() {
-                                        //let ref _reference = rpss[rpss.len()-1-(if rpss.len() == rpss.capacity() { s.ue() as usize } else { 0 })];
-                                        let ref _reference = if false/*is_slice_header*/ { &rps[rps.len()-1-s.ue() as usize] } else { rps.last().unwrap() };
-                                        let _delta = if s.bit() { -1 } else { 1 } * (s.ue()+1) as i8;
-                                        //let mut parse = |(reference,_)| { let used = s.bit(); if used || s.bit() { Some((reference+delta, used)) } else { None } };
-                                        unimplemented!()//reference.iter().filter_map(parse).chain(std::iter::once(parse((0,false)))).collect()
-                                    } else {
-                                        let negative = s.ue() as usize;
-                                        let positive = s.ue() as usize;
-                                        use std::iter::successors;
-                                        successors(Some(ShortTermReferencePicture{delta_poc:0,used:false}), |ShortTermReferencePicture{delta_poc,..}| Some(ShortTermReferencePicture{delta_poc: delta_poc -1 -s.ue() as i8, used: s.bit()})).take(negative)
-                                        .collect::<Vec<_>>().into_iter().chain(
-                                        successors(Some(ShortTermReferencePicture{delta_poc:0,used:false}), |ShortTermReferencePicture{delta_poc,..}| Some(ShortTermReferencePicture{delta_poc: delta_poc+1+s.ue() as i8, used: s.bit()})).take(positive)
-                                        ).collect()
-                                    };
-                                    rps.push(e);
+                                let mut sets = Vec::<Box<[ShortTermReferencePicture]>>::with_capacity(s.ue() as usize);
+                                for i in 0..sets.capacity() {
+                                    let set = decode_short_term_reference_picture_set(s, &sets);
+                                    sets.push(set);
                                 }
-                                rps.into_boxed_slice()
+                                sets.into_boxed_slice()
                             };
+                            println!("SPS {id} {short_term_reference_picture_sets:?}");
                             let long_term_reference_picture_set = if s.bit() { (0..s.ue()).map(|_| LongTermReferencePicture{poc_lsb_sps: s.bits(log2_max_poc_lsb) as u8, used: s.bit()}).collect() } else { Default::default() };
                             let temporal_motion_vector_predictor = s.bit();
                             let strong_intra_smoothing = s.bit();
@@ -439,7 +445,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         },
                         PPS => {
                             let id = s.ue() as usize;
-                            let p = PPS{
+                            pps[id] = Some(PPS{
                                 sps: s.ue() as usize,
                                 dependent_slice_segments: s.bit(),
                                 output: s.bit(),
@@ -485,104 +491,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                 log2_parallel_merge_level: 2 + s.ue() as u8,
                                 slice_header_extension: s.bit(),
                                 pps_extension: s.bit(),
-                            };
-                            let sps = sps[p.sps].as_ref().unwrap();
-                            // start frame
-                            let picture_parameter_buffer = va::VAPictureParameterBufferHEVC{
-                                pic_width_in_luma_samples: sps.width,
-                                pic_height_in_luma_samples: sps.height,
-                                log2_min_luma_coding_block_size_minus3: sps.log2_min_coding_block_size - 3,
-                                sps_max_dec_pic_buffering_minus1: sps.layer_ordering.last().unwrap().max_dec_pic_buffering - 1,
-                                log2_diff_max_min_luma_coding_block_size: sps.log2_diff_max_min_coding_block_size,
-                                log2_min_transform_block_size_minus2: sps.log2_min_transform_block_size - 2,
-                                log2_diff_max_min_transform_block_size: sps.log2_diff_max_min_transform_block_size,
-                                max_transform_hierarchy_depth_inter: sps.max_transform_hierarchy_depth_inter,
-                                max_transform_hierarchy_depth_intra: sps.max_transform_hierarchy_depth_intra,
-                                num_short_term_ref_pic_sets: sps.short_term_reference_picture_sets.len() as u8,
-                                num_long_term_ref_pic_sps: sps.long_term_reference_picture_set.len() as u8,
-                                num_ref_idx_l0_default_active_minus1: p.num_ref_idx_l0_default_active - 1,
-                                num_ref_idx_l1_default_active_minus1: p.num_ref_idx_l1_default_active - 1,
-                                init_qp_minus26: p.pic_init_qp_minus26,
-                                pps_cb_qp_offset: p.cb_qp_offset,
-                                pps_cr_qp_offset: p.cr_qp_offset,
-                                pcm_sample_bit_depth_luma_minus1: sps.pulse_code_modulation.as_ref().map(|p| p.bit_depth - 1).unwrap_or(0),
-                                pcm_sample_bit_depth_chroma_minus1: sps.pulse_code_modulation.as_ref().map(|p| p.bit_depth_chroma - 1).unwrap_or(0),
-                                log2_min_pcm_luma_coding_block_size_minus3: sps.pulse_code_modulation.as_ref().map(|p| p.log2_min_coding_block_size - 3).unwrap_or(0),
-                                log2_diff_max_min_pcm_luma_coding_block_size: sps.pulse_code_modulation.as_ref().map(|p| p.log2_diff_max_min_coding_block_size).unwrap_or(0),
-                                diff_cu_qp_delta_depth: p.diff_cu_qp_delta_depth.unwrap_or(0),
-                                pps_beta_offset_div2: p.deblocking_filter.as_ref().map(|f| f.1.as_ref().map(|f| f.beta_offset / 2)).flatten().unwrap_or(0),
-                                pps_tc_offset_div2: p.deblocking_filter.as_ref().map(|f| f.1.as_ref().map(|f| f.tc_offset / 2)).flatten().unwrap_or(0),
-                                log2_parallel_merge_level_minus2: p.log2_parallel_merge_level - 2,
-                                bit_depth_luma_minus8: sps.bit_depth - 8,
-                                bit_depth_chroma_minus8: sps.bit_depth - 8,
-                                log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_poc_lsb - 4,
-                                num_extra_slice_header_bits: p.num_extra_slice_header_bits,
-                                pic_fields: va::_VAPictureParameterBufferHEVC__bindgen_ty_1{
-                                    bits: va::_VAPictureParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1{
-                                        _bitfield_align_1: [],
-                                        _bitfield_1: va::_VAPictureParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1::new_bitfield_1(
-                                            sps.chroma_format_idc as _,
-                                            sps.separate_colour_plane as _,
-                                            sps.pulse_code_modulation.is_some() as _,
-                                            sps.scaling_list.is_some() as _,
-                                            p.transform_skip as _,
-                                            sps.asymmetric_motion_partitioning as _,
-                                            sps.strong_intra_smoothing as _,
-                                            p.sign_data_hiding as _,
-                                            p.constrained_intra_prediction as _,
-                                            p.diff_cu_qp_delta_depth.is_some() as _,
-                                            p.weighted_prediction as _,
-                                            p.weighted_biprediction as _,
-                                            p.transquant_bypass as _,
-                                            p.tiles.1.is_some() as _,
-                                            p.tiles.0/*entropy_coding_sync*/ as _,
-                                            p.loop_filter_across_slices as _,
-                                            p.tiles.1.map(|t| t.loop_filter_across_tiles).unwrap_or(false) as _,
-                                            sps.pulse_code_modulation.as_ref().map(|p| p.loop_filter_disable).unwrap_or(false) as _,
-                                            false as _, //NoPicReordering
-                                            false as _, //NoBiPred
-                                            0, //Reserved
-                                        )
-                                    }
-                                },
-                                slice_parsing_fields: va::_VAPictureParameterBufferHEVC__bindgen_ty_2{
-                                    bits: va::_VAPictureParameterBufferHEVC__bindgen_ty_2__bindgen_ty_1{
-                                        _bitfield_align_1: [],
-                                        _bitfield_1: va::_VAPictureParameterBufferHEVC__bindgen_ty_2__bindgen_ty_1::new_bitfield_1(
-                                            p.lists_modification as _,
-                                            !sps.long_term_reference_picture_set.is_empty() as _,
-                                            sps.temporal_motion_vector_predictor as _,
-                                            p.cabac_init as _,
-                                            p.output as _,
-                                            p.dependent_slice_segments as _,
-                                            p.pic_slice_chroma_qp_offsets as _,
-                                            sps.sample_adaptive_offset as _,
-                                            /*override:*/ p.deblocking_filter.as_ref().map(|f| f.0).unwrap_or(false) as _,
-                                            /*disable:*/ p.deblocking_filter.as_ref().map(|f| f.1.is_none()).unwrap_or(false) as _,
-                                            p.slice_header_extension as _,
-                                            IRAP(unit_type) as _,
-                                            IDR(unit_type) as _,
-                                            IRAP(unit_type) as _,
-                                            0
-                                        ),
-                                    }
-                                },
-                                CurrPic: va::VAPictureHEVC {
-                                    picture_id: render_targets[0],
-                                    pic_order_cnt: 0, //TODO
-                                    flags: 0, //LONG_REF?
-                                    va_reserved: [0; 4],
-                                },
-                                ReferenceFrames: unimplemented!(),
-                                num_tile_columns_minus1: p.tiles.1.map(|t| t.columns.len() - 1).unwrap_or(0) as u8,
-                                num_tile_rows_minus1: p.tiles.1.map(|t| t.rows.len() - 1).unwrap_or(0) as u8,
-                                //column_width_minus1: p.tiles.1.map(|t| { let iter=t.columns.into_iter().map(|w| w-1).chain(std::iter::repeat(0)); [_;_].map(|_| iter.next().unwrap()) }).unwrap_or_default(),
-                                column_width_minus1: p.tiles.1.map(|t| t.columns.into_iter().map(|w| w-1).chain(std::iter::repeat(0)).take(19).collect::<Vec<_>>().try_into().unwrap()).unwrap_or_default(),
-                                row_height_minus1: p.tiles.1.map(|t| t.rows.into_iter().map(|h| h-1).chain(std::iter::repeat(0)).take(15).collect::<Vec<_>>().try_into().unwrap()).unwrap_or_default(),
-                                st_rps_bits: if unimplemented!()/*(h->sh.short_term_ref_pic_set_sps_flag == 0 && h->sh.short_term_rps)*/ { unimplemented!()/*h->sh.short_term_ref_pic_set_size*/ } else { 0 },
-                                va_reserved: [0; _]
-                            };
-                            pps[id] = Some(p);
+                            });
                         }
                         IDR_N_LP|TRAIL_R|TRAIL_N => {
                             println!("{}", match unit_type {IDR_N_LP=>"IDR_N_LP",TRAIL_R=>"TRAIL_R",TRAIL_N=>"TRAIL_N",_=>unreachable!()});
@@ -599,7 +508,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                 dependent_slice_segment
                             } else { false };
                             if !dependent_slice_segment {
-                                let _slice_reserved_undetermined = s.bits(pps.num_extra_slice_header_bits);
+                                s.advance(pps.num_extra_slice_header_bits);
                                 let _slice_type = s.ue();
                                 let _output = pps.output && s.bit();
                                 let _separate_colour_plane = if sps.separate_colour_plane { s.bits(2) } else { 0 };
@@ -618,6 +527,115 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                     (if /*matches!(unit_type,BLA_W_RADL|BLA_W_LP|BLA_N_LP)*/false { 0 } else { poc_msb }) + poc_lsb
                                 } else { 0 };
                                 if temporal_id == 0 && !matches!(unit_type, TRAIL_N/*|TSA_N|STSA_N|RADL_N|RASL_N|RADL_R|RASL_R*/) { poc_tid0 = output_picture_number; }
+                                let (set, strps_encoded_bits_len_skip) = if !IDR(unit_type) {
+                                    if !s.bit() { let start = s.available()+1; (Some(decode_short_term_reference_picture_set(s, &sps.short_term_reference_picture_sets)), Some((start - s.available()) as u32)) }
+                                    else {
+                                        let set = if sps.short_term_reference_picture_sets.len()>1 { s.bits((sps.short_term_reference_picture_sets.len()-1<<1).ilog2() as u8) as usize } else { 0 };
+                                        (Some(sps.short_term_reference_picture_sets[set].clone()), None)
+                                    }
+                                } else { (None, None) };
+                                if first_slice_in_pic {
+                                    let mut buffer = 0; //VABufferID
+                                    check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VAPictureParameterBufferType, std::mem::size_of::<va::VAPictureParameterBufferHEVC> as u32, 1, &mut va::VAPictureParameterBufferHEVC{
+                                        pic_width_in_luma_samples: sps.width,
+                                        pic_height_in_luma_samples: sps.height,
+                                        log2_min_luma_coding_block_size_minus3: sps.log2_min_coding_block_size - 3,
+                                        sps_max_dec_pic_buffering_minus1: sps.layer_ordering.last().unwrap().max_dec_pic_buffering - 1,
+                                        log2_diff_max_min_luma_coding_block_size: sps.log2_diff_max_min_coding_block_size,
+                                        log2_min_transform_block_size_minus2: sps.log2_min_transform_block_size - 2,
+                                        log2_diff_max_min_transform_block_size: sps.log2_diff_max_min_transform_block_size,
+                                        max_transform_hierarchy_depth_inter: sps.max_transform_hierarchy_depth_inter,
+                                        max_transform_hierarchy_depth_intra: sps.max_transform_hierarchy_depth_intra,
+                                        num_short_term_ref_pic_sets: sps.short_term_reference_picture_sets.len() as u8,
+                                        num_long_term_ref_pic_sps: sps.long_term_reference_picture_set.len() as u8,
+                                        num_ref_idx_l0_default_active_minus1: pps.num_ref_idx_l0_default_active - 1,
+                                        num_ref_idx_l1_default_active_minus1: pps.num_ref_idx_l1_default_active - 1,
+                                        init_qp_minus26: pps.pic_init_qp_minus26,
+                                        pps_cb_qp_offset: pps.cb_qp_offset,
+                                        pps_cr_qp_offset: pps.cr_qp_offset,
+                                        pcm_sample_bit_depth_luma_minus1: sps.pulse_code_modulation.as_ref().map(|p| p.bit_depth - 1).unwrap_or(0),
+                                        pcm_sample_bit_depth_chroma_minus1: sps.pulse_code_modulation.as_ref().map(|p| p.bit_depth_chroma - 1).unwrap_or(0),
+                                        log2_min_pcm_luma_coding_block_size_minus3: sps.pulse_code_modulation.as_ref().map(|p| p.log2_min_coding_block_size - 3).unwrap_or(0),
+                                        log2_diff_max_min_pcm_luma_coding_block_size: sps.pulse_code_modulation.as_ref().map(|p| p.log2_diff_max_min_coding_block_size).unwrap_or(0),
+                                        diff_cu_qp_delta_depth: pps.diff_cu_qp_delta_depth.unwrap_or(0),
+                                        pps_beta_offset_div2: pps.deblocking_filter.as_ref().map(|f| f.1.as_ref().map(|f| f.beta_offset / 2)).flatten().unwrap_or(0),
+                                        pps_tc_offset_div2: pps.deblocking_filter.as_ref().map(|f| f.1.as_ref().map(|f| f.tc_offset / 2)).flatten().unwrap_or(0),
+                                        log2_parallel_merge_level_minus2: pps.log2_parallel_merge_level - 2,
+                                        bit_depth_luma_minus8: sps.bit_depth - 8,
+                                        bit_depth_chroma_minus8: sps.bit_depth - 8,
+                                        log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_poc_lsb - 4,
+                                        num_extra_slice_header_bits: pps.num_extra_slice_header_bits,
+                                        pic_fields: va::_VAPictureParameterBufferHEVC__bindgen_ty_1{
+                                            bits: va::_VAPictureParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1{
+                                                _bitfield_align_1: [],
+                                                _bitfield_1: va::_VAPictureParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1::new_bitfield_1(
+                                                    sps.chroma_format_idc as _,
+                                                    sps.separate_colour_plane as _,
+                                                    sps.pulse_code_modulation.is_some() as _,
+                                                    sps.scaling_list.is_some() as _,
+                                                    pps.transform_skip as _,
+                                                    sps.asymmetric_motion_partitioning as _,
+                                                    sps.strong_intra_smoothing as _,
+                                                    pps.sign_data_hiding as _,
+                                                    pps.constrained_intra_prediction as _,
+                                                    pps.diff_cu_qp_delta_depth.is_some() as _,
+                                                    pps.weighted_prediction as _,
+                                                    pps.weighted_biprediction as _,
+                                                    pps.transquant_bypass as _,
+                                                    pps.tiles.1.is_some() as _,
+                                                    pps.tiles.0/*entropy_coding_sync*/ as _,
+                                                    pps.loop_filter_across_slices as _,
+                                                    pps.tiles.1.as_ref().map(|t| t.loop_filter_across_tiles).unwrap_or(false) as _,
+                                                    sps.pulse_code_modulation.as_ref().map(|pcm| pcm.loop_filter_disable).unwrap_or(false) as _,
+                                                    false as _, //NoPicReordering
+                                                    false as _, //NoBiPred
+                                                    0, //Reserved
+                                                )
+                                            }
+                                        },
+                                        slice_parsing_fields: va::_VAPictureParameterBufferHEVC__bindgen_ty_2{
+                                            bits: va::_VAPictureParameterBufferHEVC__bindgen_ty_2__bindgen_ty_1{
+                                                _bitfield_align_1: [],
+                                                _bitfield_1: va::_VAPictureParameterBufferHEVC__bindgen_ty_2__bindgen_ty_1::new_bitfield_1(
+                                                    pps.lists_modification as _,
+                                                    !sps.long_term_reference_picture_set.is_empty() as _,
+                                                    sps.temporal_motion_vector_predictor as _,
+                                                    pps.cabac_init as _,
+                                                    pps.output as _,
+                                                    pps.dependent_slice_segments as _,
+                                                    pps.pic_slice_chroma_qp_offsets as _,
+                                                    sps.sample_adaptive_offset as _,
+                                                    /*override:*/ pps.deblocking_filter.as_ref().map(|f| f.0).unwrap_or(false) as _,
+                                                    /*disable:*/ pps.deblocking_filter.as_ref().map(|f| f.1.is_none()).unwrap_or(false) as _,
+                                                    pps.slice_header_extension as _,
+                                                    IRAP(unit_type) as _,
+                                                    IDR(unit_type) as _,
+                                                    IRAP(unit_type) as _,
+                                                    0
+                                                ),
+                                            }
+                                        },
+                                        CurrPic: va::VAPictureHEVC {
+                                            picture_id: surfaces[0],
+                                            pic_order_cnt: 0, //TODO
+                                            flags: 0, //SHORT|LONG _REF
+                                            va_reserved: [0; 4],
+                                        },
+                                        ReferenceFrames: [va::VAPictureHEVC {
+                                            picture_id: 0,
+                                            pic_order_cnt: 0, //TODO
+                                            flags: 0, //PREV|NEXT, SHORT|LONG _REF
+                                            va_reserved: [0; 4],
+                                        }; _],
+                                        num_tile_columns_minus1: pps.tiles.1.as_ref().map(|t| t.columns.len() - 1).unwrap_or(0) as u8,
+                                        num_tile_rows_minus1: pps.tiles.1.as_ref().map(|t| t.rows.len() - 1).unwrap_or(0) as u8,
+                                        //column_width_minus1: pps.tiles.1.map(|t| { let iter=t.columns.into_iter().map(|w| w-1).chain(std::iter::repeat(0)); [_;_].map(|_| iter.next().unwrap()) }).unwrap_or_default(),
+                                        column_width_minus1: pps.tiles.1.as_ref().map(|t| t.columns.into_iter().map(|w| w-1).chain(std::iter::repeat(0)).take(19).collect::<Vec<_>>().try_into().unwrap()).unwrap_or_default(),
+                                        row_height_minus1: pps.tiles.1.as_ref().map(|t| t.rows.into_iter().map(|h| h-1).chain(std::iter::repeat(0)).take(15).collect::<Vec<_>>().try_into().unwrap()).unwrap_or_default(),
+                                        st_rps_bits: strps_encoded_bits_len_skip.unwrap_or(0),
+                                        va_reserved: [0; _]
+                                    } as *mut _ as *mut std::ffi::c_void, &mut buffer)});
+                                } // first_slice
                             }
                         }
                         _ => panic!("Unit {unit_type:?}"),
@@ -636,6 +654,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
         },
         Cues(_) => {},
+        Chapters(_) => {},
         _ => panic!("{element:?}")
     }}
     Ok(())
