@@ -1,58 +1,24 @@
-#![feature(int_log,unchecked_math)]
-#![allow(dead_code)]
+#![feature(int_log,unchecked_math,generic_arg_infer)]
+#![allow(dead_code,unreachable_code,unused_variables)]
 
 use nom::combinator::iterator;
 use nom::number::complete::be_u32;
 fn unit(input: &[u8]) -> nom::IResult<&[u8], &[u8]> { let (rest, length) = be_u32(input)?; let length = length as usize; Ok((&rest[length..], &rest[..length])) }
 
-struct BitReader<'t> {
-    pub word: u64,
-    ptr: *const u8,
-    end: *const u8,
-    count: u32,
-    phantom: ::core::marker::PhantomData<&'t [u8]>,
-}
-impl<'t> BitReader<'t> {
-    fn new(data: &'t [u8]) -> Self {
-        Self {
-            ptr: data.as_ptr(),
-            end: data.as_ptr_range().end,
-            word: 0,
-            count: 0,
-            phantom: ::core::marker::PhantomData,
-        }
-    }
-    unsafe fn refill(&mut self) {
-        self.word |= core::ptr::read_unaligned(self.ptr as *const u64).to_be() >> self.count;
-        self.ptr = self.ptr.add(7);
-        self.ptr = self.ptr.sub((self.count as usize >> 3) & 7);
-        self.count |= 56;
-    }
-    fn peek(&self, count: u32) -> u64 { unsafe { self.word.unchecked_shr(64 - count as u64) } }
-    fn consume(&mut self, count: u32) { self.word <<= count; self.count -= count; }
-    #[track_caller] fn bits(&mut self, count: u32) -> u64 {
-        if count > self.count { unsafe { self.refill(); } }
-        let result = self.peek(count);
-        self.consume(count);
-        result
-    }
-    fn bit(&mut self) -> bool { self.bits(1) != 0 }
-    fn u8(&mut self) -> u8 { self.bits(8) as u8 }
-    fn u16(&mut self) -> u16 { self.bits(16) as u16 }
-    fn u32(&mut self) -> u32 { self.bits(32) as u32 }
-    fn ue(&mut self) -> u64 { // Exp-Golomb
-        unsafe { self.refill(); }
-        let count = self.word.leading_zeros();
-        self.consume(count);
-        self.bits(1+count) - 1
-    }
-    fn se(&mut self) -> i64 {
-        let v = self.ue() as i64;
-        let sign = -(v & 1);
-        ((v >> 1) ^ sign) - sign
-    }
-    fn available(&self, len: usize) -> bool { self.count as usize + (self.end as usize-self.ptr as usize)*8 > len }
-}
+pub const AUD: u8 = 35;
+pub const SEI_PREFIX: u8 = 39;
+pub const VPS: u8 = 32;
+pub const SPS: u8 = 33;
+pub const PPS: u8 = 34;
+pub const IDR_W_RADL: u8 = 19;
+pub const IDR_N_LP: u8 = 20;
+pub const TRAIL_R: u8 = 1;
+pub const TRAIL_N: u8 = 0;
+
+#[allow(non_snake_case)] fn IRAP(unit_type: u8) -> bool { 16 <= unit_type && unit_type <= 23 }
+#[allow(non_snake_case)] fn IDR(unit_type: u8) -> bool { matches!(unit_type, IDR_W_RADL|IDR_N_LP) }
+
+mod bit; use bit::BitReader;
 
 fn profile_tier_level(s: &mut BitReader, max_layers: usize) {
     assert!(s.available(88));
@@ -90,17 +56,13 @@ fn profile_tier_level(s: &mut BitReader, max_layers: usize) {
         });
     }
 }
-#[derive(Default,Clone,Copy)] struct LayerOrdering { max_dec_pic_buffering: u64, num_reorder_pics: u64, max_latency_increase: u64 }
-fn layer_ordering(s: &mut BitReader, max_layers: usize) -> [LayerOrdering; 8] {
-    let mut layer_ordering = [LayerOrdering::default(); 8];
-    for i in 0 .. if s.bit() { max_layers } else { 1 } {
-        layer_ordering[i] = LayerOrdering{
-            max_dec_pic_buffering: s.ue() + 1,
-            num_reorder_pics: s.ue(),
-            max_latency_increase: {let mut v = s.ue(); if v > 0 { v -= 1; } v},
-        };
-    }
-    layer_ordering
+#[derive(Default,Clone,Copy)] struct LayerOrdering { max_dec_pic_buffering: u8, num_reorder_pics: u8, max_latency_increase: u8 }
+fn layer_ordering(s: &mut BitReader, max_layers: usize) -> Box<[LayerOrdering]> {
+    (0 .. (if s.bit() { max_layers } else { 1 })).map(|_| LayerOrdering{
+        max_dec_pic_buffering: 1 + s.ue() as u8,
+        num_reorder_pics: s.ue() as u8,
+        max_latency_increase: {let mut v = s.ue(); if v > 0 { v -= 1; } v} as u8,
+    }).collect()
 }
 
 fn hrd_parameters(s: &mut BitReader, common_inf: bool, max_layers: usize) {
@@ -154,7 +116,7 @@ fn scaling_list(s: &mut BitReader) {
             let matrix_size = [6,6,6,2][i];
             for _j in 0..matrix_size {
                 if !s.bit() {
-                    /*pred_matrix_id_delta[i][j] =*/ s.ue();
+                    /*prediction_matrix_id_delta[i][j] =*/ s.ue();
                 } else {
                     if i >= 2 { /*dc_coef_minus8[i][j] =*/ s.se(); }
                     /*delta_coef[i][j] =*/ for _ in 0..[16,64,64,64][i] { s.se(); }
@@ -164,47 +126,63 @@ fn scaling_list(s: &mut BitReader) {
     } else { Default::default() }
 }
 
-pub const AUD: u8 = 35;
-pub const SEI_PREFIX: u8 = 39;
-pub const VPS: u8 = 32;
-pub const SPS: u8 = 33;
-pub const PPS: u8 = 34;
-pub const IDR_N_LP: u8 = 20;
-pub const TRAIL_R: u8 = 1;
-pub const TRAIL_N: u8 = 0;
-
 struct VPS {}
+struct ShortTermReferencePicture { delta_poc: i8, used: bool }
+struct LongTermReferencePicture { poc_lsb_sps: u8, used: bool } // _by_curr_pic_sps
+struct PulseCodeModulation { bit_depth: u8, bit_depth_chroma: u8, log2_min_coding_block_size: u8, log2_diff_max_min_coding_block_size: u8, loop_filter_disable: bool }
+
 struct SPS {
     separate_colour_plane: bool,
-    width: u32,
-    height: u32,
-    log2_max_poc_lsb: u32,
+    chroma_format_idc: u8,
+    width: u16,
+    height: u16,
+    bit_depth: u8,
+    log2_max_poc_lsb: u8,
+    layer_ordering: Box<[LayerOrdering]>, // 8
+    log2_min_coding_block_size: u8,
+    log2_diff_max_min_coding_block_size: u8,
+    log2_min_transform_block_size: u8,
+    log2_diff_max_min_transform_block_size: u8,
+    max_transform_hierarchy_depth_inter: u8,
+    max_transform_hierarchy_depth_intra: u8,
+    scaling_list: Option<()>,
+    asymmetric_motion_partitioning: bool,
+    sample_adaptive_offset: bool,
+    pulse_code_modulation: Option<PulseCodeModulation>,
+    short_term_reference_picture_sets: Box<[Box<[ShortTermReferencePicture]>]>,
+    long_term_reference_picture_set: Box<[LongTermReferencePicture]>,
+    temporal_motion_vector_predictor: bool,
+    strong_intra_smoothing: bool,
 }
+
+struct DeblockingFilter { beta_offset: i8, tc_offset: i8 }
+struct Tiles {columns: Box<[u16]>, rows: Box<[u16]>, loop_filter_across_tiles: bool}
+
 struct PPS {
     sps: usize,
     dependent_slice_segments: bool,
     output: bool,
-    num_extra_slice_header_bits: u32,
+    num_extra_slice_header_bits: u8,
     sign_data_hiding: bool,
     cabac_init: bool,
-    num_ref_idx_l0_default_active: u64,
-    num_ref_idx_l1_default_active: u64,
-    pic_init_qp_minus26: i64,
-    constrained_intra_pred: bool,
+    num_ref_idx_l0_default_active: u8,
+    num_ref_idx_l1_default_active: u8,
+    pic_init_qp_minus26: i8,
+    constrained_intra_prediction: bool,
     transform_skip: bool,
-    cu_qp_delta_depth: u64,
-    cb_qp_offset: i64,
-    cr_qp_offset: i64,
-    pic_slice_level_chroma_qp_offsets: bool,
-    weighted_pred: bool,
-    weighted_bipred: bool,
+    diff_cu_qp_delta_depth: Option<u8>,
+    cb_qp_offset: i8,
+    cr_qp_offset: i8,
+    pic_slice_chroma_qp_offsets: bool,
+    weighted_prediction: bool,
+    weighted_biprediction: bool,
     transquant_bypass: bool,
-    tiles: (),
-    seq_loop_filter_across_slices: bool,
-    deblocking_filter: (),
-    scaling_list: (),
+    tiles: (/*entropy_coding_sync*/bool, Option<Tiles>),
+    loop_filter_across_slices: bool,
+    deblocking_filter: Option<(/*deblocking_filter_override*/bool, Option<DeblockingFilter>)>,
+    scaling_list: Option<()>,
     lists_modification: bool,
-    log2_parallel_merge_level: u64,
+    log2_parallel_merge_level: u8,
     slice_header_extension: bool,
     pps_extension: bool
 }
@@ -222,6 +200,35 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut sps : [_; 16] = Default::default();
     let mut pps = (|len|{let mut v = Vec::new(); v.resize_with(len, || None); v})(64); //: [_; 64] = Default::default();
     let mut poc_tid0 = 0;
+
+    struct Card(std::fs::File);
+    let card = Card(std::fs::OpenOptions::new().read(true).write(true).open("/dev/dri/card0").unwrap());
+    impl std::os::unix::io::AsRawFd for Card { fn as_raw_fd(&self) -> std::os::unix::io::RawFd { self.0.as_raw_fd() } }
+    use std::os::unix::io::AsRawFd;
+    let va = unsafe{va::va_display_drm::vaGetDisplayDRM(card.0.as_raw_fd())};
+    #[repr(C)] struct AVVAAPIDeviceContext { display: va::VADisplay, driver_quirks: std::ffi::c_uint }
+    extern "C" fn error(_user_context: *mut std::ffi::c_void, message: *const std::ffi::c_char) { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(message)}) }
+    unsafe{va::vaSetErrorCallback(va, Some(error), std::ptr::null_mut())};
+    extern "C" fn info(_user_context: *mut std::ffi::c_void, message: *const std::ffi::c_char) { println!("{:?}", unsafe{std::ffi::CStr::from_ptr(message)}); }
+    unsafe{va::vaSetInfoCallback(va,  Some(info),  std::ptr::null_mut())};
+    let (mut major, mut minor) = (0,0);
+    #[track_caller] fn check(status: va::va_str::VAStatus) { if status!=0 { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(va::vaErrorStr(status))}); } }
+    check(unsafe{va::vaInitialize(va, &mut major, &mut minor)});
+    let mut profiles = Vec::with_capacity(unsafe{va::vaMaxNumProfiles(va)} as usize);
+    let mut len = profiles.capacity() as i32;
+    check(unsafe{va::vaQueryConfigProfiles(va, profiles.as_mut_ptr(), &mut len)});
+    unsafe{profiles.set_len(len as usize)};
+    let (profile, entrypoint) = profiles.into_iter().find_map(|profile| (profile /* != va::va_display::VAProfile_VAProfileNone*/== va::va_display::VAProfile_VAProfileHEVCMain10).then(||{
+        let mut entrypoints = Vec::with_capacity(unsafe{va::vaMaxNumEntrypoints(va)} as usize);
+        let mut len = entrypoints.capacity() as i32;
+        check(unsafe{va::vaQueryConfigEntrypoints(va, profile, entrypoints.as_mut_ptr(), &mut len)});
+        unsafe{entrypoints.set_len(len as usize)};
+        (profile, entrypoints.into_iter().find(|&entrypoint| entrypoint == va::va_display::VAEntrypoint_VAEntrypointVLD).unwrap())
+    })).unwrap();
+    let mut config = 0; // va::VAConfigID
+    check(unsafe{va::vaCreateConfig(va, profile, entrypoint, std::ptr::null_mut(), 0, &mut config)});
+    let mut render_targets = [0; 1];
+
     let mut parse_nal = |data| {
                     pub fn clear_start_code_emulation_prevention_3_byte(data: &[u8]) -> Vec<u8> {
                         data.iter()
@@ -325,51 +332,60 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             let id = s.ue() as usize;
                             println!("SPS {id}");
                             assert!(id < sps.len(), "{id}");
-                            let chroma_format_idc = s.ue();
+                            let chroma_format_idc = s.ue() as u8;
                             let separate_colour_plane = if chroma_format_idc == 3 { s.bit() } else { false };
-                            let _chroma_format_idc = if separate_colour_plane { 0 } else { chroma_format_idc };
-                            let width = s.ue() as u32;
-                            let height = s.ue() as u32;
+                            let chroma_format_idc = if separate_colour_plane { 0 } else { chroma_format_idc };
+                            let width = s.ue() as u16;
+                            let height = s.ue() as u16;
+
+                            check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_YUV420_10, width as _, height as _, render_targets.as_mut_ptr(), render_targets.len() as _, std::ptr::null_mut(), 0)});
+
                             if s.bit() { let (_left, _right, _top, _bottom) = (s.ue(), s.ue(), s.ue(), s.ue()); }
-                            let _bit_depth = s.ue() + 8;
-                            let _bit_depth_chroma = s.ue() + 8;
-                            let log2_max_poc_lsb = s.ue() as u32 + 4;
-                            layer_ordering(s, max_layers);
-                            let _log2_min_cb_size = s.ue() + 3;
-                            let _log2_diff_max_min_coding_block_size = s.ue();
-                            let _log2_min_tb_size = s.ue() + 2;
-                            let _log2_diff_max_min_transform_block_size = s.ue();
-                            let _max_transform_hierarchy_depth_inter = s.ue();
-                            let _max_transform_hierarchy_depth_intra = s.ue();
-                            if s.bit() { let _scaling_list = scaling_list(s); }
-                            let _amp = s.bit();
-                            let _sao = s.bit();
-                            if s.bit() { // PCM
-                                let _bit_depth = s.bits(4) + 1;
-                                let _bit_depth_chroma = s.bits(4) + 1;
-                                let pcm_log2_min_pcm_cb_size = 3 + s.ue();
-                                let _pcm_log2_max_pcm_cb_size = pcm_log2_min_pcm_cb_size + s.ue();
-                                let _pcm_loop_filter_disable = s.bit();
-                            }
-                            let rpss_len = s.ue() as usize;
-                            let mut rpss = Vec::<Vec<(i8, bool)>>::new();
-                            for i in 0..rpss_len {
-                                let rps = if i > 0 && s.bit() {
-                                    let ref _reference = rpss[i-1-(if i == rpss_len { s.ue() as usize } else { 0 })];
-                                    let _delta = if s.bit() { -1 } else { 1 } * (s.ue()+1) as i8;
-                                    //let mut parse = |(reference,_)| { let used = s.bit(); if used || s.bit() { Some((reference+delta, used)) } else { None } };
-                                    unimplemented!()//reference.iter().filter_map(parse).chain(std::iter::once(parse((0,false)))).collect()
-                                } else {
-                                    let negative = s.ue() as usize;
-                                    let positive = s.ue() as usize;
-                                    use std::iter::successors;
-                                    successors(Some((0,false)), |(p,_)| Some((p-1-s.ue() as i8, s.bit()))).take(negative).collect::<Vec<_>>().into_iter().chain(successors(Some((0,false)), |(p,_)| Some((p+1+s.ue() as i8, s.bit()))).take(positive)).collect()
-                                };
-                                rpss.push(rps);
-                            }
-                            if s.bit() { let _/*lt_ref_pic_poc_lsb_sps, used_by_curr_pic_lt_sps*/ = (0..s.ue()).map(|_| (s.bits(log2_max_poc_lsb), s.bit())); }
-                            let _temporal_mvp = s.bit();
-                            let _strong_intra_smoothing = s.bit();
+                            let bit_depth = 8 + s.ue() as u8;
+                            let _bit_depth_chroma = 8 + s.ue() as u8;
+                            let log2_max_poc_lsb = 4 + s.ue() as u8;
+                            let layer_ordering = layer_ordering(s, max_layers);
+                            let log2_min_coding_block_size = 3 + s.ue() as u8;
+                            let log2_diff_max_min_coding_block_size = s.ue() as u8;
+                            let log2_min_transform_block_size = 2 + s.ue() as u8;
+                            let log2_diff_max_min_transform_block_size = s.ue() as u8;
+                            let max_transform_hierarchy_depth_inter = s.ue() as u8;
+                            let max_transform_hierarchy_depth_intra = s.ue() as u8;
+                            let scaling_list = s.bit().then(|| scaling_list(s));
+                            let asymmetric_motion_partitioning = s.bit();
+                            let sample_adaptive_offset = s.bit();
+                            let pulse_code_modulation = s.bit().then(|| PulseCodeModulation{
+                                bit_depth: 1 + s.bits(4) as u8,
+                                bit_depth_chroma: 1 + s.bits(4) as u8,
+                                log2_min_coding_block_size: 3 + s.ue() as u8,
+                                log2_diff_max_min_coding_block_size: s.ue() as u8,
+                                loop_filter_disable: s.bit()
+                            });
+                            let short_term_reference_picture_sets = {
+                                let mut rps = Vec::<Box<[ShortTermReferencePicture]>>::with_capacity(s.ue() as usize);
+                                for i in 0..rps.capacity() {
+                                    let e = if i > 0 && s.bit() {
+                                        //let ref _reference = rpss[rpss.len()-1-(if rpss.len() == rpss.capacity() { s.ue() as usize } else { 0 })];
+                                        let ref _reference = if false/*is_slice_header*/ { &rps[rps.len()-1-s.ue() as usize] } else { rps.last().unwrap() };
+                                        let _delta = if s.bit() { -1 } else { 1 } * (s.ue()+1) as i8;
+                                        //let mut parse = |(reference,_)| { let used = s.bit(); if used || s.bit() { Some((reference+delta, used)) } else { None } };
+                                        unimplemented!()//reference.iter().filter_map(parse).chain(std::iter::once(parse((0,false)))).collect()
+                                    } else {
+                                        let negative = s.ue() as usize;
+                                        let positive = s.ue() as usize;
+                                        use std::iter::successors;
+                                        successors(Some(ShortTermReferencePicture{delta_poc:0,used:false}), |ShortTermReferencePicture{delta_poc,..}| Some(ShortTermReferencePicture{delta_poc: delta_poc -1 -s.ue() as i8, used: s.bit()})).take(negative)
+                                        .collect::<Vec<_>>().into_iter().chain(
+                                        successors(Some(ShortTermReferencePicture{delta_poc:0,used:false}), |ShortTermReferencePicture{delta_poc,..}| Some(ShortTermReferencePicture{delta_poc: delta_poc+1+s.ue() as i8, used: s.bit()})).take(positive)
+                                        ).collect()
+                                    };
+                                    rps.push(e);
+                                }
+                                rps.into_boxed_slice()
+                            };
+                            let long_term_reference_picture_set = if s.bit() { (0..s.ue()).map(|_| LongTermReferencePicture{poc_lsb_sps: s.bits(log2_max_poc_lsb) as u8, used: s.bit()}).collect() } else { Default::default() };
+                            let temporal_motion_vector_predictor = s.bit();
+                            let strong_intra_smoothing = s.bit();
                             if s.bit() { // VUI
                                 if s.bit() { // SAR
                                     let sar = s.u8();
@@ -410,69 +426,174 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             let _sps_extension = s.bit();
-                            sps[id] = Some(SPS{separate_colour_plane, width, height, log2_max_poc_lsb});
+                            sps[id] = Some(SPS{separate_colour_plane, chroma_format_idc, width, height, bit_depth, log2_max_poc_lsb, layer_ordering,
+                                log2_min_coding_block_size, log2_diff_max_min_coding_block_size,
+                                log2_min_transform_block_size, log2_diff_max_min_transform_block_size, max_transform_hierarchy_depth_inter, max_transform_hierarchy_depth_intra,
+                                scaling_list,
+                                asymmetric_motion_partitioning,
+                                sample_adaptive_offset,
+                                pulse_code_modulation,
+                                short_term_reference_picture_sets, long_term_reference_picture_set,
+                                temporal_motion_vector_predictor,
+                                strong_intra_smoothing});
                         },
                         PPS => {
                             let id = s.ue() as usize;
-                            pps[id] = Some(PPS{
+                            let p = PPS{
                                 sps: s.ue() as usize,
                                 dependent_slice_segments: s.bit(),
                                 output: s.bit(),
-                                num_extra_slice_header_bits: s.bits(3) as u32,
+                                num_extra_slice_header_bits: s.bits(3) as u8,
                                 sign_data_hiding: s.bit(),
                                 cabac_init: s.bit(),
-                                num_ref_idx_l0_default_active: s.ue() + 1,
-                                num_ref_idx_l1_default_active: s.ue() + 1,
-                                pic_init_qp_minus26: s.se(),
-                                constrained_intra_pred: s.bit(),
+                                num_ref_idx_l0_default_active: 1 + s.ue() as u8,
+                                num_ref_idx_l1_default_active: 1 + s.ue() as u8,
+                                pic_init_qp_minus26: s.se() as i8,
+                                constrained_intra_prediction: s.bit(),
                                 transform_skip: s.bit(),
-                                cu_qp_delta_depth: if s.bit() { s.ue() } else { 0 },
-                                cb_qp_offset: s.se(),
-                                cr_qp_offset: s.se(),
-                                pic_slice_level_chroma_qp_offsets: s.bit(),
-                                weighted_pred: s.bit(),
-                                weighted_bipred: s.bit(),
+                                diff_cu_qp_delta_depth: s.bit().then(|| s.ue() as u8),
+                                cb_qp_offset: s.se() as i8,
+                                cr_qp_offset: s.se() as i8,
+                                pic_slice_chroma_qp_offsets: s.bit(),
+                                weighted_prediction: s.bit(),
+                                weighted_biprediction: s.bit(),
                                 transquant_bypass: s.bit(),
                                 tiles: {
-                                    let _tiles = s.bit();
-                                    let _entropy_coding_sync = s.bit();
-                                    if _tiles {
-                                        let _num_tile_columns = s.ue() + 1;
-                                        let _num_tile_rows = s.ue() + 1;
-                                        if !s.bit() { // not uniform spacing
+                                    let tiles = s.bit();
+                                    let entropy_coding_sync = s.bit();
+                                    (entropy_coding_sync, tiles.then(|| {
+                                        let columns = 1 + s.ue();
+                                        let rows = 1 + s.ue();
+                                        let (columns, rows) = if !s.bit() { // not uniform spacing
                                             unimplemented!();//let _column_widths = (0.._num_tile_columns-1).map(|_| s.ue() + 1).collect();
                                             //let _row_heights = (0.._num_tile_rows-1).map(|_| s.ue() + 1).collect();
-                                        }
-                                        let _loop_filter_across_tiles = s.bit();
-                                    }
+                                        } else { unimplemented!(); };
+                                        let loop_filter_across_tiles = s.bit();
+                                        Tiles{columns, rows, loop_filter_across_tiles}
+                                    }))
                                 },
-                                seq_loop_filter_across_slices: s.bit(),
-                                deblocking_filter: if s.bit() {
-                                    let _deblocking_filter_override_enabled = s.bit();
-                                    if !s.bit() { // not disable dbf
-                                        let _beta_offset = 2 * s.se();
-                                        let _tc_offset = 2 * s.se();
-                                    }
-                                },
-                                scaling_list: if s.bit() { let _scaling_list = scaling_list(s); },
+                                loop_filter_across_slices: s.bit(),
+                                deblocking_filter: s.bit().then(|| {
+                                    let deblocking_filter_override = s.bit();
+                                    (deblocking_filter_override, (!s.bit()).then(|| DeblockingFilter{ // not disable dbf
+                                        beta_offset: 2 * s.se() as i8,
+                                        tc_offset: 2 * s.se() as i8
+                                    }))
+                                }),
+                                scaling_list: s.bit().then(|| scaling_list(s)),
                                 lists_modification: s.bit(),
-                                log2_parallel_merge_level: s.ue() + 2,
+                                log2_parallel_merge_level: 2 + s.ue() as u8,
                                 slice_header_extension: s.bit(),
                                 pps_extension: s.bit(),
-                            });
-                            println!("PPS {id} {}", pps[id].as_ref().unwrap().sps);
+                            };
+                            let sps = sps[p.sps].as_ref().unwrap();
+                            // start frame
+                            let picture_parameter_buffer = va::VAPictureParameterBufferHEVC{
+                                pic_width_in_luma_samples: sps.width,
+                                pic_height_in_luma_samples: sps.height,
+                                log2_min_luma_coding_block_size_minus3: sps.log2_min_coding_block_size - 3,
+                                sps_max_dec_pic_buffering_minus1: sps.layer_ordering.last().unwrap().max_dec_pic_buffering - 1,
+                                log2_diff_max_min_luma_coding_block_size: sps.log2_diff_max_min_coding_block_size,
+                                log2_min_transform_block_size_minus2: sps.log2_min_transform_block_size - 2,
+                                log2_diff_max_min_transform_block_size: sps.log2_diff_max_min_transform_block_size,
+                                max_transform_hierarchy_depth_inter: sps.max_transform_hierarchy_depth_inter,
+                                max_transform_hierarchy_depth_intra: sps.max_transform_hierarchy_depth_intra,
+                                num_short_term_ref_pic_sets: sps.short_term_reference_picture_sets.len() as u8,
+                                num_long_term_ref_pic_sps: sps.long_term_reference_picture_set.len() as u8,
+                                num_ref_idx_l0_default_active_minus1: p.num_ref_idx_l0_default_active - 1,
+                                num_ref_idx_l1_default_active_minus1: p.num_ref_idx_l1_default_active - 1,
+                                init_qp_minus26: p.pic_init_qp_minus26,
+                                pps_cb_qp_offset: p.cb_qp_offset,
+                                pps_cr_qp_offset: p.cr_qp_offset,
+                                pcm_sample_bit_depth_luma_minus1: sps.pulse_code_modulation.as_ref().map(|p| p.bit_depth - 1).unwrap_or(0),
+                                pcm_sample_bit_depth_chroma_minus1: sps.pulse_code_modulation.as_ref().map(|p| p.bit_depth_chroma - 1).unwrap_or(0),
+                                log2_min_pcm_luma_coding_block_size_minus3: sps.pulse_code_modulation.as_ref().map(|p| p.log2_min_coding_block_size - 3).unwrap_or(0),
+                                log2_diff_max_min_pcm_luma_coding_block_size: sps.pulse_code_modulation.as_ref().map(|p| p.log2_diff_max_min_coding_block_size).unwrap_or(0),
+                                diff_cu_qp_delta_depth: p.diff_cu_qp_delta_depth.unwrap_or(0),
+                                pps_beta_offset_div2: p.deblocking_filter.as_ref().map(|f| f.1.as_ref().map(|f| f.beta_offset / 2)).flatten().unwrap_or(0),
+                                pps_tc_offset_div2: p.deblocking_filter.as_ref().map(|f| f.1.as_ref().map(|f| f.tc_offset / 2)).flatten().unwrap_or(0),
+                                log2_parallel_merge_level_minus2: p.log2_parallel_merge_level - 2,
+                                bit_depth_luma_minus8: sps.bit_depth - 8,
+                                bit_depth_chroma_minus8: sps.bit_depth - 8,
+                                log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_poc_lsb - 4,
+                                num_extra_slice_header_bits: p.num_extra_slice_header_bits,
+                                pic_fields: va::_VAPictureParameterBufferHEVC__bindgen_ty_1{
+                                    bits: va::_VAPictureParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1{
+                                        _bitfield_align_1: [],
+                                        _bitfield_1: va::_VAPictureParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1::new_bitfield_1(
+                                            sps.chroma_format_idc as _,
+                                            sps.separate_colour_plane as _,
+                                            sps.pulse_code_modulation.is_some() as _,
+                                            sps.scaling_list.is_some() as _,
+                                            p.transform_skip as _,
+                                            sps.asymmetric_motion_partitioning as _,
+                                            sps.strong_intra_smoothing as _,
+                                            p.sign_data_hiding as _,
+                                            p.constrained_intra_prediction as _,
+                                            p.diff_cu_qp_delta_depth.is_some() as _,
+                                            p.weighted_prediction as _,
+                                            p.weighted_biprediction as _,
+                                            p.transquant_bypass as _,
+                                            p.tiles.1.is_some() as _,
+                                            p.tiles.0/*entropy_coding_sync*/ as _,
+                                            p.loop_filter_across_slices as _,
+                                            p.tiles.1.map(|t| t.loop_filter_across_tiles).unwrap_or(false) as _,
+                                            sps.pulse_code_modulation.as_ref().map(|p| p.loop_filter_disable).unwrap_or(false) as _,
+                                            false as _, //NoPicReordering
+                                            false as _, //NoBiPred
+                                            0, //Reserved
+                                        )
+                                    }
+                                },
+                                slice_parsing_fields: va::_VAPictureParameterBufferHEVC__bindgen_ty_2{
+                                    bits: va::_VAPictureParameterBufferHEVC__bindgen_ty_2__bindgen_ty_1{
+                                        _bitfield_align_1: [],
+                                        _bitfield_1: va::_VAPictureParameterBufferHEVC__bindgen_ty_2__bindgen_ty_1::new_bitfield_1(
+                                            p.lists_modification as _,
+                                            !sps.long_term_reference_picture_set.is_empty() as _,
+                                            sps.temporal_motion_vector_predictor as _,
+                                            p.cabac_init as _,
+                                            p.output as _,
+                                            p.dependent_slice_segments as _,
+                                            p.pic_slice_chroma_qp_offsets as _,
+                                            sps.sample_adaptive_offset as _,
+                                            /*override:*/ p.deblocking_filter.as_ref().map(|f| f.0).unwrap_or(false) as _,
+                                            /*disable:*/ p.deblocking_filter.as_ref().map(|f| f.1.is_none()).unwrap_or(false) as _,
+                                            p.slice_header_extension as _,
+                                            IRAP(unit_type) as _,
+                                            IDR(unit_type) as _,
+                                            IRAP(unit_type) as _,
+                                            0
+                                        ),
+                                    }
+                                },
+                                CurrPic: va::VAPictureHEVC {
+                                    picture_id: render_targets[0],
+                                    pic_order_cnt: 0, //TODO
+                                    flags: 0, //LONG_REF?
+                                    va_reserved: [0; 4],
+                                },
+                                ReferenceFrames: unimplemented!(),
+                                num_tile_columns_minus1: p.tiles.1.map(|t| t.columns.len() - 1).unwrap_or(0) as u8,
+                                num_tile_rows_minus1: p.tiles.1.map(|t| t.rows.len() - 1).unwrap_or(0) as u8,
+                                //column_width_minus1: p.tiles.1.map(|t| { let iter=t.columns.into_iter().map(|w| w-1).chain(std::iter::repeat(0)); [_;_].map(|_| iter.next().unwrap()) }).unwrap_or_default(),
+                                column_width_minus1: p.tiles.1.map(|t| t.columns.into_iter().map(|w| w-1).chain(std::iter::repeat(0)).take(19).collect::<Vec<_>>().try_into().unwrap()).unwrap_or_default(),
+                                row_height_minus1: p.tiles.1.map(|t| t.rows.into_iter().map(|h| h-1).chain(std::iter::repeat(0)).take(15).collect::<Vec<_>>().try_into().unwrap()).unwrap_or_default(),
+                                st_rps_bits: if unimplemented!()/*(h->sh.short_term_ref_pic_set_sps_flag == 0 && h->sh.short_term_rps)*/ { unimplemented!()/*h->sh.short_term_ref_pic_set_size*/ } else { 0 },
+                                va_reserved: [0; _]
+                            };
+                            pps[id] = Some(p);
                         }
                         IDR_N_LP|TRAIL_R|TRAIL_N => {
                             println!("{}", match unit_type {IDR_N_LP=>"IDR_N_LP",TRAIL_R=>"TRAIL_R",TRAIL_N=>"TRAIL_N",_=>unreachable!()});
                             let first_slice_in_pic = s.bit();
-                            #[allow(non_snake_case)] fn IRAP(unit_type: u8) -> bool { 16 <= unit_type && unit_type <= 23 }
                             if IRAP(unit_type) { let _no_output_of_prior_pics = s.bit(); }
                             let ref pps = pps[s.ue() as usize].as_ref().unwrap();
                             let ref sps = sps[pps.sps].as_ref().unwrap_or_else(|| panic!("{}", pps.sps));
                             let dependent_slice_segment = if !first_slice_in_pic {
                                 let dependent_slice_segment = pps.dependent_slice_segments && s.bit();
                                 let pic_size = sps.width * sps.height;
-                                let slice_address_length = ((pic_size-1)<<1).ilog2();
+                                let slice_address_length = ((pic_size-1)<<1).ilog2() as u8;
                                 assert!(slice_address_length < 24);
                                 let _slice_segment_address = s.bits(slice_address_length);
                                 dependent_slice_segment
@@ -482,7 +603,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                 let _slice_type = s.ue();
                                 let _output = pps.output && s.bit();
                                 let _separate_colour_plane = if sps.separate_colour_plane { s.bits(2) } else { 0 };
-                                let output_picture_number = if !matches!(unit_type, /*IDR_W_RADL|*/IDR_N_LP) {
+                                let output_picture_number = if !IDR(unit_type) {
                                     let poc_lsb = s.bits(sps.log2_max_poc_lsb);
                                     let max_poc_lsb = 1 << sps.log2_max_poc_lsb;
                                     let prev_poc_lsb = poc_tid0 % max_poc_lsb;
