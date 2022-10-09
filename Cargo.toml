@@ -14,6 +14,3 @@ va={package='libva-sys',version='*'}
 
 [patch.'crates-io']
 libva-sys={git='https://github.com/vgarleanu/libva-sys', commit='f5d78be'}
-
-[profile.dev]
-panic='abort'

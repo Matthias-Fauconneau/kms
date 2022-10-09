@@ -1,8 +1,6 @@
 #![allow(incomplete_features)]#![feature(int_log,unchecked_math,generic_arg_infer, generic_const_exprs, array_methods, array_zip)]
 #![allow(dead_code,unreachable_code,unused_variables)]
 
-//#[inline] pub /*unsafe*/ fn replace_with/*_or_abort_unchecked*/<T, F: FnOnce(T) -> T>(v: &mut T, f: F) { unsafe{std::ptr::write(v, f(std::ptr::read(v)))} }
-
 fn from_iter_or_else<T, const N: usize>(iter: impl IntoIterator<Item=T>, f: impl Fn() -> T+Copy) -> [T; N] { let mut iter = iter.into_iter(); [(); N].map(|_| iter.next().unwrap_or_else(f)) }
 fn from_iter_or<T: Copy, const N: usize>(iter: impl IntoIterator<Item=T>, v: T) -> [T; N] { from_iter_or_else(iter, || v) }
 fn from_iter<T: Default, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] { from_iter_or_else(iter, || Default::default()) }
@@ -226,9 +224,11 @@ fn decode_short_term_reference_picture_set(s: &mut BitReader, sets: &[Box<[Short
         let negative = s.ue() as usize;
         let positive = s.ue() as usize;
         let mut v = Vec::with_capacity(negative+positive);
-        use std::iter::successors; type P = ShortTermReferencePicture;
-        v.extend(successors(Some(P{delta_poc:0,used:false}), |P{delta_poc,..}| Some(P{delta_poc: delta_poc -1 -s.ue() as i8, used: s.bit()})).take(negative));
-        v.extend(successors(Some(P{delta_poc:0,used:false}), |P{delta_poc,..}| Some(P{delta_poc: delta_poc+1+s.ue() as i8, used: s.bit()})).take(positive));
+        /*use std::iter::repeat_with;*/ type P = ShortTermReferencePicture;
+        //v.extend({let mut a=0; repeat_with(|| { a=a-1-s.ue() as i8; P{delta_poc: a, used: s.bit()}}).take(negative)});
+        {let mut a = 0; for _ in 0..negative { a=a-1-s.ue() as i8; v.push(P{delta_poc: a, used: s.bit()}); }}
+        //v.extend(successors(Some(P{delta_poc:0,used:false}), |P{delta_poc,..}| Some(P{delta_poc: delta_poc+1+s.ue() as i8, used: s.bit()})).take(positive));
+        {let mut a = 0; for _ in 0..positive { a=a+1+s.ue() as i8; v.push(P{delta_poc: a, used: s.bit()}); }}
         v.into_boxed_slice()
     }
 }
@@ -625,7 +625,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         }
                     });
                     let frames = frames.as_mut().unwrap();
-                    //if reference.is_none() { replace_with(frames, |f| f.map(|Frame{id,..}| Frame{id, poc: None})); }
                     if temporal_id == 0 && !matches!(unit_type, TRAIL_N/*|TSA_N|STSA_N|RADL_N|RASL_N|RADL_R|RASL_R*/) { poc_tid0 = reference.as_ref().map(|r| r.poc).unwrap_or(0); }
                     let chroma = sps.chroma_format_idc>0;
                     let sample_adaptive_offset = sps.sample_adaptive_offset.then(|| LumaChroma{luma: s.bit(), chroma: chroma.then(|| s.bit())}).unwrap_or(LumaChroma{luma: false, chroma: chroma.then(|| false)});
@@ -674,6 +673,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         let reference = sh.reference.as_ref();
                         let current_poc = reference.map(|r| r.poc).unwrap_or(0);
                         use itertools::Itertools;
+                        println!("POC {}", current_poc);
                         println!("DPB [{}]", frames.iter().filter_map(|f| f.poc).format(" "));
                         reference.map(|r| println!("refs [{}]", r.short_term_pictures.iter().map(|p| (current_poc as i8+p.delta_poc) as u8).chain(r.long_term_pictures.iter().map(|p| p.poc)).format(" ")));
                         for Frame{poc: frame_poc,..} in frames.iter_mut() {
