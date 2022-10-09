@@ -1,7 +1,11 @@
 #![allow(incomplete_features)]#![feature(int_log,unchecked_math,generic_arg_infer, generic_const_exprs, array_methods, array_zip)]
 #![allow(dead_code,unreachable_code,unused_variables)]
 
-fn from_iter<T: Default, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] { let mut iter = iter.into_iter(); [(); N].map(|_| iter.next().unwrap_or_default()) }
+//#[inline] pub /*unsafe*/ fn replace_with/*_or_abort_unchecked*/<T, F: FnOnce(T) -> T>(v: &mut T, f: F) { unsafe{std::ptr::write(v, f(std::ptr::read(v)))} }
+
+fn from_iter_or_else<T, const N: usize>(iter: impl IntoIterator<Item=T>, f: impl Fn() -> T+Copy) -> [T; N] { let mut iter = iter.into_iter(); [(); N].map(|_| iter.next().unwrap_or_else(f)) }
+fn from_iter_or<T: Copy, const N: usize>(iter: impl IntoIterator<Item=T>, v: T) -> [T; N] { from_iter_or_else(iter, || v) }
+fn from_iter<T: Default, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] { from_iter_or_else(iter, || Default::default()) }
 fn array<T: Default, const N: usize>(len: usize, mut f: impl FnMut()->T) -> [T; N] { from_iter((0..len).map(|_| f())) }
 
 fn ceil_log2(x: usize) -> u8 { ((x-1)<<1).ilog2() as u8 }
@@ -231,9 +235,9 @@ fn decode_short_term_reference_picture_set(s: &mut BitReader, sets: &[Box<[Short
 
 struct SHReference {
     poc: u8,
-    short_term_picture_set: Box<[ShortTermReferencePicture]>,
+    short_term_pictures: Box<[ShortTermReferencePicture]>,
     short_term_picture_set_encoded_bits_len_skip: Option<u32>,
-    long_term_picture_set: Box<[LongTermReferencePicture]>,
+    long_term_pictures: Box<[LongTermReferencePicture]>,
     temporal_motion_vector_predictor: bool
 }
 
@@ -313,7 +317,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     })).unwrap();
     let mut config = 0; // va::VAConfigID
     check(unsafe{va::vaCreateConfig(va, profile, entrypoint, std::ptr::null_mut(), 0, &mut config)});
-    let mut surfaces = [0; 1];
+    #[derive(Default)] struct Frame {
+        id: VASurfaceID,
+        poc: Option<u8>,
+    }
+    let mut frames = None;
     let mut context = 0;
 
     let ref mut parse_nal = |data: &[u8]| {
@@ -425,8 +433,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 let width = s.ue() as u16;
                 let height = s.ue() as u16;
 
-                check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_YUV420_10, width as _, height as _, surfaces.as_mut_ptr(), surfaces.len() as _, std::ptr::null_mut(), 0)});
-                check(unsafe{va::vaCreateContext(va, config, width as _, height as _, va::VA_PROGRESSIVE as _, surfaces.as_mut_ptr(), surfaces.len() as _, &mut context)});
+                let mut ids = [0; 16];
+                check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_YUV420_10, width as _, height as _, ids.as_mut_ptr(), ids.len() as _, std::ptr::null_mut(), 0)});
+                check(unsafe{va::vaCreateContext(va, config, width as _, height as _, va::VA_PROGRESSIVE as _, ids.as_ptr() as *mut _, ids.len() as _, &mut context)});
+                frames = Some(ids.map(|id| Frame{id, poc: None}));
 
                 if s.bit() { let (_left, _right, _top, _bottom) = (s.ue(), s.ue(), s.ue(), s.ue()); }
                 let bit_depth = 8 + s.ue() as u8;
@@ -580,6 +590,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     let color_plane_id = if sps.separate_color_plane { s.bits(2) } else { 0 } as u8;
                     let reference = (!Instantaneous_Decoder_Refresh(unit_type)).then(|| {
                         let poc_lsb = s.bits(sps.log2_max_poc_lsb) as u8;
+                        /*println!("{}", sps.log2_max_poc_lsb);
                         let max_poc_lsb = 1 << sps.log2_max_poc_lsb;
                         let prev_poc_lsb = poc_tid0 % max_poc_lsb;
                         let prev_poc_msb = poc_tid0 - prev_poc_lsb;
@@ -589,16 +600,16 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             prev_poc_msb - max_poc_lsb
                         } else {
                             prev_poc_msb
-                        };
-                        let poc = ((if /*matches!(unit_type,BLA_W_RADL|BLA_W_LP|BLA_N_LP)*/false { 0 } else { poc_msb }) + poc_lsb) as u8;
+                        };*/
+                        let poc = (/*if /*matches!(unit_type,BLA_W_RADL|BLA_W_LP|BLA_N_LP)*/false { 0 } else { poc_msb } +*/ poc_lsb) as u8;
                         let (short_term_picture_set, short_term_picture_set_encoded_bits_len_skip) = if !s.bit() { let start = s.available()+1; (decode_short_term_reference_picture_set(s, &sps.short_term_reference_picture_sets), Some((start - s.available()) as u32)) }
                         else {
                             let set = if sps.short_term_reference_picture_sets.len()>1 { s.bits(ceil_log2(sps.short_term_reference_picture_sets.len()-1<<1)) as usize } else { 0 };
                             (sps.short_term_reference_picture_sets[set].clone(), None)
                         };
                         SHReference{
-                            poc, short_term_picture_set, short_term_picture_set_encoded_bits_len_skip,
-                            long_term_picture_set: sps.long_term_reference_picture_set.as_ref().map(|set| {
+                            poc, short_term_pictures: short_term_picture_set, short_term_picture_set_encoded_bits_len_skip,
+                            long_term_pictures: sps.long_term_reference_picture_set.as_ref().map(|set| {
                                 let sequence = if !set.is_empty() { s.ue() } else { 0 };
                                 let slice = s.ue();
                                 let mut v = Vec::with_capacity((sequence+slice) as usize);
@@ -613,6 +624,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             temporal_motion_vector_predictor: sps.temporal_motion_vector_predictor && s.bit()
                         }
                     });
+                    let frames = frames.as_mut().unwrap();
+                    //if reference.is_none() { replace_with(frames, |f| f.map(|Frame{id,..}| Frame{id, poc: None})); }
                     if temporal_id == 0 && !matches!(unit_type, TRAIL_N/*|TSA_N|STSA_N|RADL_N|RASL_N|RADL_R|RASL_R*/) { poc_tid0 = reference.as_ref().map(|r| r.poc).unwrap_or(0); }
                     let chroma = sps.chroma_format_idc>0;
                     let sample_adaptive_offset = sps.sample_adaptive_offset.then(|| LumaChroma{luma: s.bit(), chroma: chroma.then(|| s.bit())}).unwrap_or(LumaChroma{luma: false, chroma: chroma.then(|| false)});
@@ -622,7 +635,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             if s.bit() { MayB{p: 1 + s.ue() as usize, b: b.then(|| 1 + s.ue() as usize)} }
                             else { MayB{p:pps.num_ref_idx_l0_default_active, b: b.then_some(pps.num_ref_idx_l1_default_active)} };
                         let reference = reference.as_ref().unwrap();
-                        let references_len = reference.short_term_picture_set.iter().filter(|p| p.used).count() + reference.long_term_picture_set.iter().filter(|p| p.used).count();
+                        let references_len = reference.short_term_pictures.iter().filter(|p| p.used).count() + reference.long_term_pictures.iter().filter(|p| p.used).count();
                         SHInter{
                             active_references,
                             list_entry_lx: (pps.lists_modification && references_len > 1).then(|| active_references.map(|len| (0..len).map(|_| s.bits(ceil_log2(references_len)) as u8).collect::<Box<_>>())),
@@ -648,7 +661,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                             }),
                             max_num_merge_cand: 5 - s.ue() as u8
                         }
-                    });
+                    }); // inter
                     let qp_delta = s.se() as i8;
                     let qp_offsets = pps.slice_chroma_qp_offsets.then(|| (s.se() as i8, s.se() as i8));
                     //cu_chroma_qp_offsets: pps.chroma_qp_offset_list && s.bit(),
@@ -657,6 +670,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     sh = Some(SliceHeader{slice_type, output, color_plane_id, reference, sample_adaptive_offset, inter, qp_delta, qp_offsets,/*cu_chroma_qp_offsets,*/deblocking_filter, loop_filter_across_slices});
 
                     if first_slice {
+                        let sh = sh.as_ref().unwrap();
+                        let reference = sh.reference.as_ref();
+                        let current_poc = reference.map(|r| r.poc).unwrap_or(0);
+                        use itertools::Itertools;
+                        println!("DPB [{}]", frames.iter().filter_map(|f| f.poc).format(" "));
+                        reference.map(|r| println!("refs [{}]", r.short_term_pictures.iter().map(|p| (current_poc as i8+p.delta_poc) as u8).chain(r.long_term_pictures.iter().map(|p| p.poc)).format(" ")));
+                        for Frame{poc: frame_poc,..} in frames.iter_mut() {
+                            *frame_poc = frame_poc.filter(|&frame_poc| reference.map(|r| r.short_term_pictures.iter().any(|p| ((current_poc as i8+p.delta_poc) as u8) == frame_poc) || r.long_term_pictures.iter().any(|p| p.poc == frame_poc)).unwrap_or(false));
+                        }
+                        let ref mut current = frames.iter_mut().find(|f| f.poc.is_none()).unwrap();
+                        current.poc = Some(current_poc);
+
                         let mut buffer = 0; //VABufferID
                         check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VAPictureParameterBufferType, std::mem::size_of::<va::VAPictureParameterBufferHEVC>() as std::ffi::c_uint, 1,
                             &mut va::VAPictureParameterBufferHEVC{
@@ -733,24 +758,36 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                     ),
                                 }},
                                 CurrPic: va::VAPictureHEVC {
-                                    picture_id: surfaces[0],
-                                    pic_order_cnt: 0, //TODO
-                                    flags: 0, //SHORT|LONG _REF
+                                    picture_id: current.id,
+                                    pic_order_cnt: current_poc as i32,
+                                    flags: 0,
                                     va_reserved: [0; 4],
                                 },
-                                ReferenceFrames: [va::VAPictureHEVC {
-                                    picture_id: 0,
-                                    pic_order_cnt: 0, //TODO
-                                    flags: 0, //PREV|NEXT, SHORT|LONG _REF
-                                    va_reserved: [0; 4],
-                                }; _],
+                                ReferenceFrames: from_iter_or(frames.iter().filter_map(|frame| {
+                                    let frame_poc = frame.poc?;
+                                    Some(va::VAPictureHEVC{
+                                        picture_id: frame.id,
+                                        pic_order_cnt: frame_poc as i32,
+                                        flags: reference.map(|r|
+                                            r.short_term_pictures.iter().filter_map(|&ShortTermReferencePicture{delta_poc, used}| used.then(|| (current_poc as i8+delta_poc) as u8)).find(|&poc| poc == frame_poc).map(|poc|
+                                                match poc.cmp(&current_poc) {
+                                                    std::cmp::Ordering::Less => VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE,
+                                                    std::cmp::Ordering::Greater => VA_PICTURE_HEVC_RPS_ST_CURR_AFTER,
+                                                    _ => unreachable!()
+                                                }
+                                            ).unwrap_or(0) |
+                                            if r.long_term_pictures.iter().any(|&LongTermReferencePicture{poc, used}| used && poc == frame_poc) { VA_PICTURE_HEVC_RPS_LT_CURR } else {0}
+                                        ).unwrap_or(0),
+                                        va_reserved:[0;_]
+                                    })
+                                }), va::VAPictureHEVC{picture_id:0,pic_order_cnt:0,flags:0,va_reserved:[0;_]}),
                                 num_tile_columns_minus1: pps.tiles.1.as_ref().map(|t| t.columns.len() - 1).unwrap_or(0) as u8,
                                 num_tile_rows_minus1: pps.tiles.1.as_ref().map(|t| t.rows.len() - 1).unwrap_or(0) as u8,
                                 column_width_minus1: pps.tiles.1.as_ref().map(|t| from_iter(t.columns.into_iter().map(|w| w-1))).unwrap_or_default(),
                                 row_height_minus1: pps.tiles.1.as_ref().map(|t| from_iter(t.rows.into_iter().map(|h| h-1))).unwrap_or_default(),
-                                st_rps_bits: sh.as_ref().unwrap().reference.as_ref().map(|r| r.short_term_picture_set_encoded_bits_len_skip).flatten().unwrap_or(0),
+                                st_rps_bits: reference.map(|r| r.short_term_picture_set_encoded_bits_len_skip).flatten().unwrap_or(0),
                                 va_reserved: [0; _]
-                            } as *mut _ as *mut std::ffi::c_void, &mut buffer)
+                            } as *const _ as *mut _, &mut buffer)
                         });
                         if let Some(scaling_list) = pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()) {
                             check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VAIQMatrixBufferType, std::mem::size_of::<va::VAIQMatrixBufferHEVC> as u32, 1, &mut VAIQMatrixBufferHEVC{
@@ -761,7 +798,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                 ScalingListDC32x32: scaling_list.x32.map(|x| x.0),
                                 ScalingList32x32: scaling_list.x32.map(|x| x.1),
                                 va_reserved: [0; _],
-                            } as *mut _ as *mut std::ffi::c_void, &mut buffer)});
+                            } as *const _ as *mut _, &mut buffer)});
                         }
                     } // first_slice
                 } // !dependent_slice_segment
@@ -811,14 +848,31 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     delta_chroma_weight_l1: prediction_weights.chroma.clone().unwrap_or_default().pb.b.unwrap_or_default().weight,
                     luma_offset_l1: prediction_weights.luma.pb.b.unwrap_or_default().offset,
                     ChromaOffsetL1: prediction_weights.chroma.unwrap_or_default().pb.b.unwrap_or_default().offset,
-                    RefPicList: unimplemented!(), // ref->refPicList[list_idx][i]
+                    RefPicList: sh.reference.as_ref().map(|r| {
+                        fn index(frames: &[Frame], ref_poc: u8) -> u8 { frames.iter().filter_map(|frame| frame.poc).position(|poc| poc == ref_poc).unwrap_or_else(|| panic!("Missing {ref_poc}")) as u8 }
+                        pub fn list<T>(iter: impl std::iter::IntoIterator<Item=T>) -> Box<[T]> { iter.into_iter().collect() }
+                        pub fn sort_by<T>(mut s: Box<[T]>, f: impl Fn(&T,&T)->std::cmp::Ordering) -> Box<[T]> { s.sort_by(f); s }
+                        pub fn map<T,U>(iter: impl std::iter::IntoIterator<Item=T>, f: impl Fn(T)->U) -> Box<[U]> { list(iter.into_iter().map(f)) }
+                        fn stps(frames: &[Frame], r: &SHReference, f: impl Fn(std::cmp::Ordering)->std::cmp::Ordering) -> Box<[u8]> {
+                            let current_poc = r.poc;
+                            map(&*sort_by(
+                                list(r.short_term_pictures.into_iter().filter_map(|&ShortTermReferencePicture{delta_poc, used}|(used && f(delta_poc.cmp(&0)) == std::cmp::Ordering::Greater).then(|| delta_poc))),
+                                |a,b| f(a.cmp(b))
+                            ), |delta_poc| index(frames, (current_poc as i8+delta_poc) as u8))
+                        }
+                        let frames = frames.as_ref().unwrap();
+                        let stps_after = stps(frames, r, |o| o);
+                        let stps_before = stps(frames, r, |o| o.reverse());
+                        let ltps = map(sort_by(list(r.long_term_pictures.into_iter().filter_map(|&LongTermReferencePicture{poc, used}| used.then(|| poc))), Ord::cmp).into_iter(), |&poc| index(frames, poc));
+                        [ from_iter([&*stps_before, &*stps_after, &*ltps].into_iter().flatten().copied()), from_iter([&*stps_after, &*stps_before, &*ltps].into_iter().flatten().copied())]
+                    }).unwrap_or_default(),
                     num_entry_point_offsets: 0,
                     entry_offset_to_subset_array: 0,
                     slice_data_num_emu_prevn_bytes: 0,
                     va_reserved: [0; _]
-                } as *mut _ as *mut std::ffi::c_void, &mut buffer)});
+                } as *const _ as *mut _, &mut buffer)});
                 let mut buffer = 0;
-                check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VASliceDataBufferType, data.len() as _, 1, data.as_mut_ptr() as *mut std::ffi::c_void, &mut buffer)});
+                check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VASliceDataBufferType, data.len() as _, 1, data.as_ptr() as *const std::ffi::c_void as *mut _, &mut buffer)});
             }
             _ => panic!("Unit {unit_type:?}"),
         };

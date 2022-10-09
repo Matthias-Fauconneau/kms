@@ -2,6 +2,7 @@ package={name= 'kms', version= '0.0.0', edition= '2021'}
 bin=[{name='kms',path= 'main.rs'}]
 
 [dependencies]
+itertools='*'
 num-derive='*'
 num-traits='*'
 bytemuck='*'
@@ -13,3 +14,6 @@ va={package='libva-sys',version='*'}
 
 [patch.'crates-io']
 libva-sys={git='https://github.com/vgarleanu/libva-sys', commit='f5d78be'}
+
+[profile.dev]
+panic='abort'
