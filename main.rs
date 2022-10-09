@@ -224,10 +224,8 @@ fn decode_short_term_reference_picture_set(s: &mut BitReader, sets: &[Box<[Short
         let negative = s.ue() as usize;
         let positive = s.ue() as usize;
         let mut v = Vec::with_capacity(negative+positive);
-        /*use std::iter::repeat_with;*/ type P = ShortTermReferencePicture;
-        //v.extend({let mut a=0; repeat_with(|| { a=a-1-s.ue() as i8; P{delta_poc: a, used: s.bit()}}).take(negative)});
+        type P = ShortTermReferencePicture;
         {let mut a = 0; for _ in 0..negative { a=a-1-s.ue() as i8; v.push(P{delta_poc: a, used: s.bit()}); }}
-        //v.extend(successors(Some(P{delta_poc:0,used:false}), |P{delta_poc,..}| Some(P{delta_poc: delta_poc+1+s.ue() as i8, used: s.bit()})).take(positive));
         {let mut a = 0; for _ in 0..positive { a=a+1+s.ue() as i8; v.push(P{delta_poc: a, used: s.bit()}); }}
         v.into_boxed_slice()
     }
@@ -288,7 +286,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut sps : [_; 16] = Default::default();
     let mut pps = (|len|{let mut v = Vec::new(); v.resize_with(len, || None); v})(64); //: [_; 64] = Default::default();
     let mut sh = None;
-    let mut poc_tid0 = 0;
+    //let mut poc_tid0 = 0;
 
     struct Card(std::fs::File);
     let card = Card(std::fs::OpenOptions::new().read(true).write(true).open("/dev/dri/card0").unwrap());
@@ -625,7 +623,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         }
                     });
                     let frames = frames.as_mut().unwrap();
-                    if temporal_id == 0 && !matches!(unit_type, TRAIL_N/*|TSA_N|STSA_N|RADL_N|RASL_N|RADL_R|RASL_R*/) { poc_tid0 = reference.as_ref().map(|r| r.poc).unwrap_or(0); }
+                    //if temporal_id == 0 && !matches!(unit_type, TRAIL_N/*|TSA_N|STSA_N|RADL_N|RASL_N|RADL_R|RASL_R*/) { poc_tid0 = reference.as_ref().map(|r| r.poc).unwrap_or(0); }
                     let chroma = sps.chroma_format_idc>0;
                     let sample_adaptive_offset = sps.sample_adaptive_offset.then(|| LumaChroma{luma: s.bit(), chroma: chroma.then(|| s.bit())}).unwrap_or(LumaChroma{luma: false, chroma: chroma.then(|| false)});
                     let inter = matches!(slice_type, SliceType::P | SliceType::B).then(|| {
@@ -683,6 +681,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         current.poc = Some(current_poc);
 
                         let mut buffer = 0; //VABufferID
+                        check(unsafe{va::vaBeginPicture(va, context, current.id)});
                         check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VAPictureParameterBufferType, std::mem::size_of::<va::VAPictureParameterBufferHEVC>() as std::ffi::c_uint, 1,
                             &mut va::VAPictureParameterBufferHEVC{
                                 pic_width_in_luma_samples: sps.width,
@@ -789,7 +788,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                 va_reserved: [0; _]
                             } as *const _ as *mut _, &mut buffer)
                         });
+                        check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
                         if let Some(scaling_list) = pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()) {
+                            let mut buffer = 0;
                             check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VAIQMatrixBufferType, std::mem::size_of::<va::VAIQMatrixBufferHEVC> as u32, 1, &mut VAIQMatrixBufferHEVC{
                                 ScalingList4x4: scaling_list.x4,
                                 ScalingList8x8: scaling_list.x8,
@@ -799,15 +800,16 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                 ScalingList32x32: scaling_list.x32.map(|x| x.1),
                                 va_reserved: [0; _],
                             } as *const _ as *mut _, &mut buffer)});
+                            check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
                         }
                     } // first_slice
                 } // !dependent_slice_segment
                 let sh = sh.as_ref().unwrap();
-                let mut buffer = 0;
                 let prediction_weights = sh.inter.as_ref().map(|s| s.prediction_weights.clone()/*.map(|LumaChroma{luma: l, chroma: c}| LumaChroma{
                     luma: Tables{ log2_denom_weight: l.log2_denom_weight, pb: l.pb.map(|t| WeightOffset{weight: t.map(|w| w.weight - (1<<l.log2_denom_weight)), offset: t.map(|w| w.offset)})) },
                     chroma: c.map(|c| Tables{ log2_denom_weight: c.log2_denom_weight as i8 - l.log2_denom_weight as i8, pb: c.pb.map(|t| t.map(|p| p.map(|w| WeightOffset{weight: w.weight - (1<<c.log2_denom_weight), offset: w.offset})))}),
                 })*/).flatten().unwrap_or_default();
+                let mut buffer = 0;
                 check(unsafe{vaCreateBuffer(va, context, VABufferType_VASliceParameterBufferType, std::mem::size_of::<VASliceParameterBufferHEVC>() as u32, 1, &mut VASliceParameterBufferHEVC{
                     slice_data_size: data.len() as u32,
                     slice_data_offset: 0,
@@ -871,8 +873,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     slice_data_num_emu_prevn_bytes: 0,
                     va_reserved: [0; _]
                 } as *const _ as *mut _, &mut buffer)});
+                check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
                 let mut buffer = 0;
                 check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VASliceDataBufferType, data.len() as _, 1, data.as_ptr() as *const std::ffi::c_void as *mut _, &mut buffer)});
+                check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
+                check(unsafe{va::vaEndPicture(va, context)});
             }
             _ => panic!("Unit {unit_type:?}"),
         };
