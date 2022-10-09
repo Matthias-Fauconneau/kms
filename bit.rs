@@ -1,17 +1,19 @@
 pub struct BitReader<'t> {
     pub word: u64,
+    count: u8,
     ptr: *const u8,
     end: *const u8,
-    count: u8,
+    begin: *const u8,
     phantom: ::core::marker::PhantomData<&'t [u8]>,
 }
 impl<'t> BitReader<'t> {
     pub fn new(data: &'t [u8]) -> Self {
         Self {
-            ptr: data.as_ptr(),
-            end: data.as_ptr_range().end,
             word: 0,
             count: 0,
+            ptr: data.as_ptr(),
+            end: data.as_ptr_range().end,
+            begin: data.as_ptr(),
             phantom: ::core::marker::PhantomData,
         }
     }
@@ -45,4 +47,5 @@ impl<'t> BitReader<'t> {
         ((v >> 1) ^ sign) - sign
     }
     pub fn available(&self) -> usize { self.count as usize + (self.end as usize-self.ptr as usize)*8 }
+    pub fn bits_offset(&self) -> usize { (self.ptr as usize-self.begin as usize)*8 - self.count as usize }
 }
