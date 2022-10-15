@@ -27,7 +27,7 @@ pub const TRAIL_N: u8 = 0;
 
 mod bit; use bit::BitReader;
 
-#[derive(num_derive::FromPrimitive)] enum SliceType { B, P, I }
+#[derive(Clone,Copy,num_derive::FromPrimitive)] enum SliceType { B, P, I }
 use num_traits::FromPrimitive;
 
 fn profile_tier_level(s: &mut BitReader, max_layers: usize) {
@@ -273,6 +273,11 @@ struct SliceHeader {
     loop_filter_across_slices: bool,
 }
 
+mod va {
+    #![allow(dead_code,non_camel_case_types,non_upper_case_globals,improper_ctypes)]
+    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().skip(1).next().unwrap_or(std::env::var("HOME")?+"/input.mkv");
     let input = unsafe{memmap::Mmap::map(&std::fs::File::open(path)?)}?;
@@ -292,7 +297,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let card = Card(std::fs::OpenOptions::new().read(true).write(true).open("/dev/dri/card0").unwrap());
     impl std::os::unix::io::AsRawFd for Card { fn as_raw_fd(&self) -> std::os::unix::io::RawFd { self.0.as_raw_fd() } }
     use std::os::unix::io::AsRawFd;
-    use va::va_display_drm::*;
+    use va::*;
     let va = unsafe{vaGetDisplayDRM(card.0.as_raw_fd())};
     #[repr(C)] struct AVVAAPIDeviceContext { display: va::VADisplay, driver_quirks: std::ffi::c_uint }
     extern "C" fn error(_user_context: *mut std::ffi::c_void, message: *const std::ffi::c_char) { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(message)}) }
@@ -300,7 +305,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     extern "C" fn info(_user_context: *mut std::ffi::c_void, message: *const std::ffi::c_char) { println!("{:?}", unsafe{std::ffi::CStr::from_ptr(message)}); }
     unsafe{va::vaSetInfoCallback(va,  Some(info),  std::ptr::null_mut())};
     let (mut major, mut minor) = (0,0);
-    #[track_caller] fn check(status: va::va_str::VAStatus) { if status!=0 { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(va::vaErrorStr(status))}); } }
+    #[track_caller] fn check(status: VAStatus) { if status!=0 { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(va::vaErrorStr(status))}); } }
     check(unsafe{va::vaInitialize(va, &mut major, &mut minor)});
     let mut profiles = Vec::with_capacity(unsafe{va::vaMaxNumProfiles(va)} as usize);
     let mut len = profiles.capacity() as i32;
@@ -321,6 +326,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
     let mut frames = None;
     let mut context = 0;
+    let mut current_id = None;
 
     let ref mut parse_nal = |data: &[u8]| {
         pub fn clear_start_code_emulation_prevention_3_byte(data: &[u8]) -> Vec<u8> {
@@ -677,7 +683,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         for Frame{poc: frame_poc,..} in frames.iter_mut() {
                             *frame_poc = frame_poc.filter(|&frame_poc| reference.map(|r| r.short_term_pictures.iter().any(|p| ((current_poc as i8+p.delta_poc) as u8) == frame_poc) || r.long_term_pictures.iter().any(|p| p.poc == frame_poc)).unwrap_or(false));
                         }
-                        let ref mut current = frames.iter_mut().find(|f| f.poc.is_none()).unwrap();
+                        let current = frames.iter_mut().find(|f| f.poc.is_none()).unwrap();
+                        current_id = Some(current.id);
                         current.poc = Some(current_poc);
 
                         let mut buffer = 0; //VABufferID
@@ -878,6 +885,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VASliceDataBufferType, data.len() as _, 1, data.as_ptr() as *const std::ffi::c_void as *mut _, &mut buffer)});
                 check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
                 check(unsafe{va::vaEndPicture(va, context)});
+                let mut descriptor = VADRMPRIMESurfaceDescriptor::default();
+                check(unsafe{va::vaExportSurfaceHandle(va, current_id.unwrap(), VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &mut descriptor as *mut _ as *mut _)});
             }
             _ => panic!("Unit {unit_type:?}"),
         };
