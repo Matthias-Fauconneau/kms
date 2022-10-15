@@ -274,7 +274,7 @@ struct SliceHeader {
 }
 
 mod va {
-    #![allow(dead_code,non_camel_case_types,non_upper_case_globals,improper_ctypes)]
+    #![allow(dead_code,non_camel_case_types,non_upper_case_globals,improper_ctypes,non_snake_case)]
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
@@ -357,15 +357,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         } else { 0 };
         match unit_type {
             SEI_PREFIX => {
-                let mut decode = ||{
+                fn decode(s: &mut BitReader) -> u32 {
                     let mut value = 0;
                     while {
                         let byte = s.u8();
-                        value += byte;
+                        value += byte as u32;
                         byte == 0xFF
                     }{}
                     value
-                };
+                }
                 const BUFFERING_PERIOD : u8 = 0;
                 const PICTURE_TIMING : u8 = 1;
                 const USER_DATA_REGISTERED_ITU_T_T35 : u8 = 4;
@@ -373,8 +373,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 const ACTIVE_PARAMETER_SETS : u8 = 129;
                 const MASTERING_DISPLAY_INFO : u8 = 137;
                 const CONTENT_LIGHT_LEVEL_INFO : u8 = 144;
-                let sei_type = decode();
-                let _size = decode();
+                let sei_type = s.u8();
+                let _size = decode(s);
                 //println!("{sei_type} {size} {:}", data);
                 match sei_type {
                     ACTIVE_PARAMETER_SETS => {
@@ -887,6 +887,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 check(unsafe{va::vaEndPicture(va, context)});
                 let mut descriptor = VADRMPRIMESurfaceDescriptor::default();
                 check(unsafe{va::vaExportSurfaceHandle(va, current_id.unwrap(), VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &mut descriptor as *mut _ as *mut _)});
+                /*check*/(unsafe{va::vaSyncSurface(va, current_id.unwrap())});
             }
             _ => panic!("Unit {unit_type:?}"),
         };
