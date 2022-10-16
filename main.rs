@@ -882,12 +882,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 } as *const _ as *mut _, &mut buffer)});
                 check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
                 let mut buffer = 0;
+                println!("data {}", data.len());
                 check(unsafe{va::vaCreateBuffer(va, context, VABufferType_VASliceDataBufferType, data.len() as _, 1, data.as_ptr() as *const std::ffi::c_void as *mut _, &mut buffer)});
+                //println!("render");
                 check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
+                //println!("end");
                 check(unsafe{va::vaEndPicture(va, context)});
                 let mut descriptor = VADRMPRIMESurfaceDescriptor::default();
+                println!("export {}", current_id.unwrap());
                 check(unsafe{va::vaExportSurfaceHandle(va, current_id.unwrap(), VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &mut descriptor as *mut _ as *mut _)});
-                /*check*/(unsafe{va::vaSyncSurface(va, current_id.unwrap())});
+                //println!("sync");/*check*/(unsafe{va::vaSyncSurface(va, current_id.unwrap())});
+                for plane in descriptor.objects.into_iter().filter(|plane| plane.fd != 0) { let buffer : dma_buf::DmaBuf = unsafe{std::os::unix::io::FromRawFd::from_raw_fd(plane.fd)}; }
+                println!("OK");
             }
             _ => panic!("Unit {unit_type:?}"),
         };

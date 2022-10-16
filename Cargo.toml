@@ -12,8 +12,8 @@ bytemuck='*'
 nom='*'
 memmap='*'
 matroska={version='*', git='https://github.com/rust-av/matroska'}
+dma-buf='*'
 #drm='*'
-#va={package='libva-sys',version='*'}
 
 [patch.'crates-io']
 libva-sys={git='https://github.com/vgarleanu/libva-sys', commit='f5d78be'}
