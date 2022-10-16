@@ -891,8 +891,36 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 let mut descriptor = VADRMPRIMESurfaceDescriptor::default();
                 println!("export {}", current_id.unwrap());
                 check(unsafe{va::vaExportSurfaceHandle(va, current_id.unwrap(), VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS, &mut descriptor as *mut _ as *mut _)});
+                use vector::xy;
+                let size = xy{x: descriptor.width, y: descriptor.height};
                 //println!("sync");/*check*/(unsafe{va::vaSyncSurface(va, current_id.unwrap())});
-                for plane in descriptor.objects.into_iter().filter(|plane| plane.fd != 0) { let buffer : dma_buf::DmaBuf = unsafe{std::os::unix::io::FromRawFd::from_raw_fd(plane.fd)}; }
+                {
+                    let fd = unsafe{std::os::unix::io::FromRawFd::from_raw_fd(descriptor.objects[0].fd)};
+                    use image::Image;
+                    struct Widget (Image<rustix::io::OwnedFd>);
+                    impl ui::Widget for Widget { fn paint(&mut self, target: &mut ui::Target, _: ui::size, _: ui::int2) -> ui::Result<()> {
+                        let fd = &self.0.data;
+                        let map = unsafe{memmap::Mmap::map(fd).unwrap()};
+                        const DMA_BUF_BASE: u8 = b'b';
+                        const DMA_BUF_IOCTL_SYNC: u8 = 0;
+                        const DMA_BUF_SYNC_READ: u64 = 1 << 0;
+                        const DMA_BUF_SYNC_WRITE: u64 = 1 << 1;
+                        const DMA_BUF_SYNC_END: u64 = 1 << 2;
+                        println!("sync");
+                        nix::ioctl_write_ptr!(dma_buf_ioctl_sync, DMA_BUF_BASE, DMA_BUF_IOCTL_SYNC, u64);
+                        println!("OK");
+                        let fd = fd.as_raw_fd();
+                        unsafe{dma_buf_ioctl_sync(fd, &DMA_BUF_SYNC_READ as *const _)}.unwrap();
+                        let frame = Image::<&[u16]>::cast_slice(&map[0..self.0.size.y as usize*self.0.size.x as usize*std::mem::size_of::<u16>()], self.0.size);
+                        use std::cmp::min;
+                        dbg!(self.0.size);
+                        for y in 0..min(frame.size.y, target.size.y) { for x in 0..min(frame.size.x, target.size.x) { target[xy{x,y}] = (((frame[xy{x,y}] as u32+0x80)/0x101) as u8).into(); }}
+                        unsafe{dma_buf_ioctl_sync(fd, &(DMA_BUF_SYNC_READ|DMA_BUF_SYNC_END) as *const _)}.unwrap();
+                        Ok(())
+                    } }
+                    ui::run(&mut Widget(Image{data: fd, size, stride: size.x})).unwrap();
+                    panic!("OK");
+                }
                 println!("OK");
             }
             _ => panic!("Unit {unit_type:?}"),
