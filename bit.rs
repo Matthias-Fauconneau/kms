@@ -1,4 +1,4 @@
-pub struct BitReader<'t> {
+pub struct Reader<'t> {
     pub word: u64,
     count: u8,
     ptr: *const u8,
@@ -6,7 +6,7 @@ pub struct BitReader<'t> {
     begin: *const u8,
     phantom: ::core::marker::PhantomData<&'t [u8]>,
 }
-impl<'t> BitReader<'t> {
+impl<'t> Reader<'t> {
     pub fn new(data: &'t [u8]) -> Self {
         Self {
             word: 0,
