@@ -12,18 +12,16 @@ use nom::combinator::iterator;
 use nom::number::complete::be_u32;
 fn unit(input: &[u8]) -> nom::IResult<&[u8], &[u8]> { let (rest, length) = be_u32(input)?; let length = length as usize; Ok((&rest[length..], &rest[..length])) }
 
-pub const AUD: u8 = 35;
-pub const SEI_PREFIX: u8 = 39;
-pub const VPS: u8 = 32;
-pub const SPS: u8 = 33;
-pub const PPS: u8 = 34;
-pub const IDR_W_RADL: u8 = 19;
-pub const IDR_N_LP: u8 = 20;
-pub const TRAIL_R: u8 = 1;
-pub const TRAIL_N: u8 = 0;
+#[allow(non_camel_case_types)] #[repr(u8)] #[derive(Clone,Copy,num_derive::FromPrimitive,Debug)] enum NAL {
+    TRAIL_N, TRAIL_R,
+    IDR_W_RADL = 19, // Random Access Decodable Leading
+    IDR_N_LP, // Leading Picture
+    VPS = 32, SPS, PPS, AUD,
+    SEI_PREFIX = 39
+}
 
-#[allow(non_snake_case)] fn Intra_Random_Access_Picture(unit_type: u8) -> bool { 16 <= unit_type && unit_type <= 23 }
-#[allow(non_snake_case)] fn Instantaneous_Decoder_Refresh(unit_type: u8) -> bool { matches!(unit_type, IDR_W_RADL|IDR_N_LP) }
+#[allow(non_snake_case)] fn Intra_Random_Access_Picture(unit: NAL) -> bool { 16 <= unit as u8 && unit as u8 <= 23 }
+#[allow(non_snake_case)] fn Instantaneous_Decoder_Refresh(unit: NAL) -> bool { use NAL::*; matches!(unit, IDR_W_RADL|IDR_N_LP) }
 
 mod bit; use bit::BitReader;
 
@@ -213,13 +211,15 @@ struct PPS {
     pps_extension: bool
 }
 
-fn decode_short_term_reference_picture_set(s: &mut BitReader, sets: &[Box<[ShortTermReferencePicture]>]) -> Box<[ShortTermReferencePicture]> {
+fn decode_short_term_reference_picture_set(s: &mut BitReader, sets: &[Box<[ShortTermReferencePicture]>], slice_header: bool) -> Box<[ShortTermReferencePicture]> {
     if !sets.is_empty() && /*predict*/s.bit() {
-        //let ref _reference = sets[sets.len()-1-(if is_last { s.ue() as usize } else { 0 })];
-        let ref _set = &sets[sets.len()-1-s.ue() as usize];
-        let _delta = if s.bit() { -1 } else { 1 } * (s.ue()+1) as i8;
-        //let mut parse = |(reference,_)| { let used = s.bit(); if used || s.bit() { Some((reference+delta, used)) } else { None } };
-        unimplemented!()//set.iter().filter_map(parse).chain(std::iter::once(parse((0,false)))).collect()
+        let ref set = &sets[sets.len()-1-if slice_header {s.ue() as usize} else {0}];
+        let delta = if s.bit() { -1 } else { 1 } * (s.ue()+1) as i8;
+        let mut parse = |&ShortTermReferencePicture{delta_poc,..}| { let used = s.bit(); if used || s.bit() { Some(ShortTermReferencePicture{delta_poc:delta_poc+delta, used}) } else { None } };
+        let mut set = set.iter().filter_map(&mut parse).collect::<Vec<_>>();
+        let p = parse(&ShortTermReferencePicture{delta_poc:0,used:false});
+        if let Some(p) = p { set.push(p) }
+        set.into_boxed_slice()
     } else {
         let negative = s.ue() as usize;
         let positive = s.ue() as usize;
@@ -350,13 +350,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let ref mut s = BitReader::new(&data);
         assert!(s.bit() == false); //forbidden_zero_bit
         //let _ref_idc = s.bits(2);
-        let unit_type = s.bits(/*5*/6) as u8;
+        let unit = NAL::from_u64(s.bits(/*5*/6)).unwrap();
         let temporal_id = if !false/*matches!(unit_type, EOS_NUT|EOB_NUT)*/ {
             let _layer_id = s.bits(6);
             s.bits(3) - 1
         } else { 0 };
-        match unit_type {
-            SEI_PREFIX => {
+        match unit {
+            NAL::SEI_PREFIX => {
                 fn decode(s: &mut BitReader) -> u32 {
                     let mut value = 0;
                     while {
@@ -394,8 +394,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     _ => panic!("SEI {sei_type:}"),
                 }
             }
-            AUD => println!("AUD {data:?}"),
-            VPS => {
+            NAL::AUD => println!("AUD {data:?}"),
+            NAL::VPS => {
                 println!("VPS");
                 let id = s.bits(4) as usize;
                 assert!(id == 0);
@@ -422,7 +422,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 s.bit(); // vps_extension
                 vps[id] = Some(VPS{});
             }
-            SPS => {
+            NAL::SPS => {
                 let vps = s.bits(4) as usize;
                 assert!(vps == 0);
                 let max_layers = s.bits(3) as usize + 1;
@@ -467,7 +467,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 let short_term_reference_picture_sets = {
                     let mut sets = Vec::<Box<[ShortTermReferencePicture]>>::with_capacity(s.ue() as usize);
                     for i in 0..sets.capacity() {
-                        let set = decode_short_term_reference_picture_set(s, &sets);
+                        let set = decode_short_term_reference_picture_set(s, &sets, false);
                         sets.push(set);
                     }
                     sets.into_boxed_slice()
@@ -527,7 +527,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     temporal_motion_vector_predictor,
                     strong_intra_smoothing});
             },
-            PPS => {
+            NAL::PPS => {
                 let id = s.ue() as usize;
                 pps[id] = Some(PPS{
                     sps: s.ue() as usize,
@@ -577,11 +577,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     pps_extension: s.bit(),
                 });
             }
-            IDR_N_LP|TRAIL_R|TRAIL_N => {
-                println!("{}", match unit_type {IDR_N_LP=>"IDR_N_LP",TRAIL_R=>"TRAIL_R",TRAIL_N=>"TRAIL_N",_=>unreachable!()});
+            NAL::IDR_W_RADL|NAL::IDR_N_LP|NAL::TRAIL_R|NAL::TRAIL_N => {
+                println!("{unit:?}");
                 let first_slice = s.bit();
-                if Intra_Random_Access_Picture(unit_type) { let _no_output_of_prior_pics = s.bit(); }
-                let ref pps = pps[s.ue() as usize].as_ref().unwrap();
+                if Intra_Random_Access_Picture(unit) { let _no_output_of_prior_pics = s.bit(); }
+                let pps = {let index = s.ue() as usize; pps[index].as_ref().unwrap_or_else(|| panic!("{index}"))};
                 let ref sps = sps[pps.sps].as_ref().unwrap_or_else(|| panic!("{}", pps.sps));
                 let (dependent_slice_segment, slice_segment_address) = if !first_slice {
                     let dependent_slice_segment = pps.dependent_slice_segments && s.bit();
@@ -592,7 +592,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     let slice_type = SliceType::from_u64(s.ue()).unwrap();
                     let output = pps.output && s.bit();
                     let color_plane_id = if sps.separate_color_plane { s.bits(2) } else { 0 } as u8;
-                    let reference = (!Instantaneous_Decoder_Refresh(unit_type)).then(|| {
+                    let reference = (!Instantaneous_Decoder_Refresh(unit)).then(|| {
                         let poc_lsb = s.bits(sps.log2_max_poc_lsb) as u8;
                         /*println!("{}", sps.log2_max_poc_lsb);
                         let max_poc_lsb = 1 << sps.log2_max_poc_lsb;
@@ -605,8 +605,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         } else {
                             prev_poc_msb
                         };*/
-                        let poc = (/*if /*matches!(unit_type,BLA_W_RADL|BLA_W_LP|BLA_N_LP)*/false { 0 } else { poc_msb } +*/ poc_lsb) as u8;
-                        let (short_term_picture_set, short_term_picture_set_encoded_bits_len_skip) = if !s.bit() { let start = s.available()+1; (decode_short_term_reference_picture_set(s, &sps.short_term_reference_picture_sets), Some((start - s.available()) as u32)) }
+                        let poc = (/*if /*matches!(unit, BLA_W_RADL|BLA_W_LP|BLA_N_LP)*/false { 0 } else { poc_msb } +*/ poc_lsb) as u8;
+                        let (short_term_picture_set, short_term_picture_set_encoded_bits_len_skip) = if !s.bit() { let start = s.available()+1; (decode_short_term_reference_picture_set(s, &sps.short_term_reference_picture_sets, true), Some((start - s.available()) as u32)) }
                         else {
                             let set = if sps.short_term_reference_picture_sets.len()>1 { s.bits(ceil_log2(sps.short_term_reference_picture_sets.len()-1<<1)) as usize } else { 0 };
                             (sps.short_term_reference_picture_sets[set].clone(), None)
@@ -629,7 +629,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         }
                     });
                     let frames = frames.as_mut().unwrap();
-                    //if temporal_id == 0 && !matches!(unit_type, TRAIL_N/*|TSA_N|STSA_N|RADL_N|RASL_N|RADL_R|RASL_R*/) { poc_tid0 = reference.as_ref().map(|r| r.poc).unwrap_or(0); }
+                    //if temporal_id == 0 && !matches!(unit, TRAIL_N/*|TSA_N|STSA_N|RADL_N|RASL_N|RADL_R|RASL_R*/) { poc_tid0 = reference.as_ref().map(|r| r.poc).unwrap_or(0); }
                     let chroma = sps.chroma_format_idc>0;
                     let sample_adaptive_offset = sps.sample_adaptive_offset.then(|| LumaChroma{luma: s.bit(), chroma: chroma.then(|| s.bit())}).unwrap_or(LumaChroma{luma: false, chroma: chroma.then(|| false)});
                     let inter = matches!(slice_type, SliceType::P | SliceType::B).then(|| {
@@ -757,9 +757,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                         /*override:*/ pps.deblocking_filter.as_ref().map(|f| f.0).unwrap_or(false) as _,
                                         /*disable:*/ pps.deblocking_filter.as_ref().map(|f| f.1.is_none()).unwrap_or(false) as _,
                                         pps.slice_header_extension as _,
-                                        Intra_Random_Access_Picture(unit_type) as _,
-                                        Instantaneous_Decoder_Refresh(unit_type) as _,
-                                        Intra_Random_Access_Picture(unit_type) as _,
+                                        Intra_Random_Access_Picture(unit) as _,
+                                        Instantaneous_Decoder_Refresh(unit) as _,
+                                        Intra_Random_Access_Picture(unit) as _,
                                         0
                                     ),
                                 }},
@@ -906,11 +906,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         const DMA_BUF_SYNC_READ: u64 = 1 << 0;
                         const DMA_BUF_SYNC_WRITE: u64 = 1 << 1;
                         const DMA_BUF_SYNC_END: u64 = 1 << 2;
-                        println!("sync");
                         nix::ioctl_write_ptr!(dma_buf_ioctl_sync, DMA_BUF_BASE, DMA_BUF_IOCTL_SYNC, u64);
-                        println!("OK");
                         let fd = fd.as_raw_fd();
+                        println!("sync");
                         unsafe{dma_buf_ioctl_sync(fd, &DMA_BUF_SYNC_READ as *const _)}.unwrap();
+                        println!("OK");
                         let frame = Image::<&[u16]>::cast_slice(&map[0..self.0.size.y as usize*self.0.size.x as usize*std::mem::size_of::<u16>()], self.0.size);
                         use std::cmp::min;
                         dbg!(self.0.size);
@@ -923,11 +923,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 }
                 println!("OK");
             }
-            _ => panic!("Unit {unit_type:?}"),
         };
     };
-    //use nom::{multi::{length_count, length_value}, sequence::pair, combinator::map, number::complete::{u8,be_u16}};
-    //length_count::<_,_,_,nom::error::Error<_>,_,_>(u8, pair(map(u8, |t| t&0x3f), length_count(be_u16, length_value(be_u16, |nal:&[u8]| Ok((nal,parse_nal(nal)))))))(&video.codec_private.as_ref().unwrap()[22..]).unwrap();
+    let s = &video.codec_private.as_ref().unwrap()[22..];
+    let (&count, s) = s.split_first().unwrap();
+    let mut s = s; for _ in 0..count { s = {
+        let (u8, s) = s.split_first().unwrap();
+        let (count, s) = {let (v, s) = s.split_at(2); (u16::from_be(unsafe{*(v as *const _ as *const u16)}), s)};
+        let mut s = s; for _ in 0..count { s = {
+            let (length, s) = {let (v, s) = s.split_at(2); (u16::from_be(unsafe{*(v as *const _ as *const u16)}), s)};
+            let (nal, s) = s.split_at(length as usize);
+            parse_nal(nal);
+            s
+        }}
+        s
+    }}
     for element in &mut iterator(input, matroska::elements::segment_element) { use  matroska::elements::SegmentElement::*; match element {
         Void(_) => {},
         Cluster(cluster) => for data_block in cluster.simple_block {

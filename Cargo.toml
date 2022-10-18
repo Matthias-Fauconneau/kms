@@ -14,7 +14,7 @@ rustix='*'
 memmap={version='*', package='memmapix'}
 matroska={version='*', git='https://github.com/rust-av/matroska'}
 nix='*'
-#drm='*'
+drm='*'
 vector={git='https://github.com/Matthias-Fauconneau/vector'}
 image={git='https://github.com/Matthias-Fauconneau/image'}
 ui={git='https://github.com/Matthias-Fauconneau/ui'}
