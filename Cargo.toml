@@ -4,7 +4,7 @@ bin=[{name='kms',path= 'main.rs'}]
 [dependencies]
 bytemuck='*'
 drm='*'
-ffmpeg ={package='ffmpeg-next', version='*'}
+ffmpeg ={package='ffmpeg-sys-next', version='*'}
 va={package='libva-sys',version='*'}
 
 [patch.'crates-io']
