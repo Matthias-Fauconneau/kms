@@ -1,5 +1,5 @@
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use drm::{Device, control::{self, Device as _, *}, buffer::DrmFourcc};
+    use drm::{Device, control::{self, Device as _, dumbbuffer::DumbBuffer, *}, buffer::{DrmFourcc, Handle, Buffer, PlanarBuffer}};
     struct Card(std::fs::File);
     impl std::os::unix::io::AsRawFd for Card { fn as_raw_fd(&self) -> std::os::unix::io::RawFd { self.0.as_raw_fd() } }
     impl Device for Card {}
@@ -17,7 +17,15 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (width, height) = (width.into(), height.into());
     let fmt = DrmFourcc::Xrgb2101010;
     let /*mut*/ db = card.create_dumb_buffer((width, height), fmt, 32).unwrap();
-    let fb = card.add_framebuffer(&db, None, 0).unwrap();
+    struct Buffer2<'t>(&'t DumbBuffer);
+    impl PlanarBuffer for Buffer2<'_> {
+        fn size(&self) -> (u32, u32) { self.0.size() }
+        fn format(&self) -> DrmFourcc { self.0.format() }
+        fn pitches(&self) -> [u32; 4] { [self.0.pitch(),0,0,0] }
+        fn handles(&self) -> [Option<Handle>; 4] { [Some(self.0.handle()),None,None,None] }
+        fn offsets(&self) -> [u32; 4] { [0; 4] }
+    }
+    let fb = card.add_planar_framebuffer(&Buffer2(&db), &[None; 4], 0).unwrap();
     let planes = card.plane_handles().unwrap();
     let (better_planes, compatible_planes): (Vec<control::plane::Handle>, Vec<control::plane::Handle>) = planes.iter()
         .filter(|&&plane| card.get_plane(plane).map(|plane_info| { let compatible_crtcs = res.filter_crtcs(plane_info.possible_crtcs()); compatible_crtcs.contains(&crtc.handle()) }).unwrap_or(false))

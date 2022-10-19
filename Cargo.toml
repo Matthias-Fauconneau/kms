@@ -7,17 +7,5 @@ drm='*'
 ffmpeg ={package='ffmpeg-sys-next', version='*'}
 va={package='libva-sys',version='*'}
 
-[dependencies]
-itertools='*'
-num-derive='*'
-num-traits='*'
-bytemuck='*'
-nom='*'
-rustix='*'
-memmap={version='*', package='memmapix'}
-matroska={version='*', git='https://github.com/rust-av/matroska'}
-nix='*'
-drm='*'
-vector={git='https://github.com/Matthias-Fauconneau/vector'}
-image={git='https://github.com/Matthias-Fauconneau/image'}
-ui={git='https://github.com/Matthias-Fauconneau/ui'}
+[patch.'crates-io']
+libva-sys={git='https://github.com/vgarleanu/libva-sys', commit='f5d78be'}
