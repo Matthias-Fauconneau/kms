@@ -61,34 +61,49 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     atomic_req.add_property(plane, find_prop_id(&card, plane, "CRTC_H").expect("Could not get CRTC_H"), property::Value::UnsignedRange(mode.size().1 as u64));
 
     use ffmpeg::*;
+    unsafe {avdevice_register_all()};
     let path = std::env::args().skip(1).next().unwrap_or(std::env::var("HOME")?+"/input.mkv");
     #[track_caller] fn check(status: std::ffi::c_int) -> std::ffi::c_int { if status!=0 { let mut s=[0;AV_ERROR_MAX_STRING_SIZE]; unsafe{av_strerror(status,s.as_mut_ptr(),s.len());} panic!("{}", unsafe{std::ffi::CStr::from_ptr(s.as_ptr())}.to_str().unwrap()); } else { status } }
     let mut context = std::ptr::null_mut();
     let path = std::ffi::CString::new(path).unwrap();
+    //unsafe{av_log_set_level(AV_LOG_TRACE)};
     check(unsafe{avformat_open_input(&mut context, path.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut())});
     check(unsafe{avformat_find_stream_info(context, std::ptr::null_mut())});
     let mut decoder = std::ptr::null_mut();
     let video_stream = check(unsafe{av_find_best_stream(context, AVMediaType::AVMEDIA_TYPE_VIDEO, -1, -1, &mut decoder, 0)});
-    for i in 0.. {
-        let config = &unsafe{*avcodec_get_hw_config(decoder, i)};
-        if (config.methods & (AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32) != 0) && config.device_type == AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI { panic!("{:?}", config.pix_fmt); }
-    }
-    let video = &mut unsafe{**(*context).streams.offset(video_stream as isize)};
+    assert!(decoder != std::ptr::null_mut());
+    let video = &mut unsafe{&**(*context).streams.offset(video_stream as isize)};
     let decoder_context = unsafe{avcodec_alloc_context3(decoder)};
     check(unsafe{avcodec_parameters_to_context(decoder_context, video.codecpar)});
-    unsafe extern "C" fn get_format(_s: *mut AVCodecContext, _fmt: *const AVPixelFormat) -> AVPixelFormat { unimplemented!(); }
-    unsafe{*decoder_context}.get_format  = Some(get_format);
+    extern "C" fn get_format(_s: *mut AVCodecContext, _fmt: *const AVPixelFormat) -> AVPixelFormat { AVPixelFormat::AV_PIX_FMT_VAAPI_VLD  }
+    unsafe{&mut *decoder_context}.get_format  = Some(get_format);
     let mut hw_device_context = std::ptr::null_mut();
     check(unsafe{av_hwdevice_ctx_create(&mut hw_device_context, AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, std::ptr::null(), std::ptr::null_mut(), 0)});
-    unsafe{*decoder_context}.hw_device_ctx = unsafe{av_buffer_ref(hw_device_context)};
+    assert!(hw_device_context != std::ptr::null_mut());
+    unsafe{&mut *decoder_context}.hw_device_ctx = dbg!(unsafe{av_buffer_ref(hw_device_context)});
+    assert!(unsafe{&mut *decoder_context}.hw_device_ctx != std::ptr::null_mut());
     check(unsafe{avcodec_open2(decoder_context, decoder, std::ptr::null_mut())});
 
     let packet = unsafe{av_packet_alloc()};
     while unsafe{av_read_frame(context, packet)} >= 0 {
-        if video_stream == unsafe{*packet}.stream_index {
+        if video_stream == unsafe{&*packet}.stream_index {
             check(unsafe{avcodec_send_packet(decoder_context, packet)});
-            let frame = unsafe{av_frame_alloc()};
-            check(unsafe{avcodec_receive_frame(decoder_context, frame)});
+            assert!(unsafe{&mut *decoder_context}.hwaccel != std::ptr::null());
+            let va = unsafe{av_frame_alloc()};
+            let status = unsafe{avcodec_receive_frame(decoder_context, va)};
+            if status == -EAGAIN { continue; }
+            check(status);
+            let drm = unsafe{av_frame_alloc()};
+            unsafe{&mut *drm}.format = AVPixelFormat::AV_PIX_FMT_DRM_PRIME as _;
+            check(unsafe{av_hwframe_map(drm, va, AV_HWFRAME_MAP_READ as _)});
+            unsafe{av_frame_unref(va)};
+            let drm = unsafe{&mut *drm};
+            {
+                let drm = unsafe{&*((&*drm).data[0] as *const AVDRMFrameDescriptor)};
+                println!("{:?}", drm.objects.map(|AVDRMObjectDescriptor{format_modifier,..}| drm_fourcc::DrmModifier::from(format_modifier)));
+                println!("{:?}", drm.layers.map(|AVDRMLayerDescriptor{format,..}| DrmFourcc::try_from(format)));
+            }
+            unsafe{av_buffer_unref(&mut drm.buf[0])};
             /*av_hwframe_transfer_data(sw_frame, frame, 0)
             size = av_image_get_buffer_size(frame.format, frame.width, frame.height, 1);
             buffer = av_malloc(size);
