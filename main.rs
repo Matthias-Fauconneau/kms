@@ -80,7 +80,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hw_device_context = std::ptr::null_mut();
     check(unsafe{av_hwdevice_ctx_create(&mut hw_device_context, AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, std::ptr::null(), std::ptr::null_mut(), 0)});
     assert!(hw_device_context != std::ptr::null_mut());
-    unsafe{&mut *decoder_context}.hw_device_ctx = dbg!(unsafe{av_buffer_ref(hw_device_context)});
+    unsafe{&mut *decoder_context}.hw_device_ctx = unsafe{av_buffer_ref(hw_device_context)};
     assert!(unsafe{&mut *decoder_context}.hw_device_ctx != std::ptr::null_mut());
     check(unsafe{avcodec_open2(decoder_context, decoder, std::ptr::null_mut())});
 
@@ -89,56 +89,41 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         if video_stream == unsafe{&*packet}.stream_index {
             check(unsafe{avcodec_send_packet(decoder_context, packet)});
             assert!(unsafe{&mut *decoder_context}.hwaccel != std::ptr::null());
-            let va = unsafe{av_frame_alloc()};
-            let status = unsafe{avcodec_receive_frame(decoder_context, va)};
+            let mut frame = unsafe{av_frame_alloc()};
+            let status = unsafe{avcodec_receive_frame(decoder_context, frame)};
             if status == -EAGAIN { continue; }
             check(status);
-            let drm = unsafe{av_frame_alloc()};
-            unsafe{&mut *drm}.format = AVPixelFormat::AV_PIX_FMT_DRM_PRIME as _;
-            check(unsafe{av_hwframe_map(drm, va, AV_HWFRAME_MAP_READ as _)});
-            unsafe{av_frame_unref(va)};
-            let drm = unsafe{&mut *drm};
-            {
-                let drm = unsafe{&*((&*drm).data[0] as *const AVDRMFrameDescriptor)};
-                println!("{:?}", drm.objects.map(|AVDRMObjectDescriptor{format_modifier,..}| drm_fourcc::DrmModifier::from(format_modifier)));
-                println!("{:?}", drm.layers.map(|AVDRMLayerDescriptor{format,..}| DrmFourcc::try_from(format)));
+            let surface = unsafe{&*frame}.data[3] as u32; // VASurfaceID
+
+            mod va {
+                #![allow(dead_code,non_camel_case_types,non_upper_case_globals,improper_ctypes,non_snake_case)]
+                include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
             }
-            unsafe{av_buffer_unref(&mut drm.buf[0])};
-            /*av_hwframe_transfer_data(sw_frame, frame, 0)
-            size = av_image_get_buffer_size(frame.format, frame.width, frame.height, 1);
-            buffer = av_malloc(size);
-            av_image_copy_to_buffer(buffer, size, frame.data, frame.linesize, frame.format, frame.width, frame.height, 1);
-            let mut map = card.map_dumb_buffer(&mut db).expect("Could not map dumbbuffer");
-            let map = bytemuck::cast_slice_mut(map.as_mut());
-            for y in 0..video.height() {
-                #[allow(non_snake_case)] for x in 0..video.width() {
-                    let plane = |index| unsafe {
-                        std::slice::from_raw_parts(
-                            (*video.as_ptr()).data[index] as *const u16,
-                            video.stride(index) * video.plane_height(index) as usize / std::mem::size_of::<u16>(),
-                        )
-                    };
-                    let Y = plane(0)[y as usize*video.stride(0)/2+x as usize];
-                    let Cb = plane(1)[(y/2) as usize*video.stride(1)/2+(x/2) as usize] as i16 - 512; // FIXME: bilinear
-                    let Cr = plane(2)[(y/2) as usize*video.stride(2)/2+(x/2) as usize] as i16 - 512; // FIXME: bilinear
-                    let Y = Y as f32;
-                    let Cr = Cr as f32;
-                    let Cb = Cb as f32;
-                    const A : f32 = 0.2627;
-                    const B : f32 = 0.6780;
-                    const C : f32 = 1.-A-B;
-                    const D : f32 = 2.*(A+B);
-                    const E : f32 = 2.*(1.-A);
-                    let r = Y + E * Cr;
-                    let g = Y - (A * E / B) * Cr - (C * D / B) * Cb;
-                    let b = Y + D * Cb;
-                    let r = r as u32;
-                    let g = g as u32;
-                    let b = b as u32;
-                    map[(y*width +x) as usize] = b | g<<10 | r<<20;
-                }
-            }
-            if card.page_flip(crtc.handle(), fb, PageFlipFlags::empty(), None).is_ok() { println!("flip!"); } else { println!("no flip"); }*/
+            use va::*;
+            #[track_caller] fn check(status: VAStatus) { if status!=0 { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(va::vaErrorStr(status))}); } }
+
+            let (va, context) = {
+                let hwaccel_priv_data = unsafe{&*((&*decoder_context).internal as *const va::AVCodecInternal)}.hwaccel_priv_data as *const VAAPIDecodeContext;
+                assert!(!hwaccel_priv_data.is_null());
+                let hwaccel_priv_data = unsafe{&*hwaccel_priv_data};
+                dbg!(unsafe{*hwaccel_priv_data.hwctx}, hwaccel_priv_data.va_context)
+            };
+
+            let mut pipeline = VA_INVALID_ID;
+            check(unsafe{vaCreateBuffer(va, context, VABufferType_VAProcPipelineParameterBufferType, std::mem::size_of::<VAProcPipelineParameterBuffer>() as _, 1, &VAProcPipelineParameterBuffer{surface,
+                ..Default::default()
+            } as *const _ as *mut _, &mut pipeline as *mut _)});
+            let mut rgb = VA_INVALID_SURFACE;
+            check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_YUV420_10, width as _, height as _, &mut rgb as *mut _, 1, std::ptr::null_mut(), 0)});
+            check(unsafe{vaBeginPicture(va, context, rgb)});
+            check(unsafe{vaRenderPicture(va, context, &pipeline as *const _ as *mut _, 1)});
+            check(unsafe{vaEndPicture(va, context)});
+
+            let mut descriptor = va::VADRMPRIMESurfaceDescriptor::default();
+            check(unsafe{va::vaExportSurfaceHandle(va, rgb, va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, va::VA_EXPORT_SURFACE_READ_ONLY | va::VA_EXPORT_SURFACE_SEPARATE_LAYERS, &mut descriptor as *mut _ as *mut _)});
+
+            unsafe{av_frame_free(&mut frame as *mut _)};
+            //if card.page_flip(crtc.handle(), fb, PageFlipFlags::empty(), None).is_ok() { println!("flip!"); } else { println!("no flip"); }
         }
         unsafe{av_packet_unref(packet)};
     }
