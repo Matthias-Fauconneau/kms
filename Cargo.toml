@@ -9,4 +9,4 @@ cc={version='*', features=['parallel']}
 bytemuck='*'
 drm-fourcc='*'
 drm='*'
-#ffmpeg ={package='ffmpeg-sys-next', version='*'}
+libc='*'
