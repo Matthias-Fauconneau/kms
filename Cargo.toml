@@ -3,9 +3,10 @@ bin=[{name='kms',path= 'main.rs'}]
 
 [build-dependencies]
 bindgen='*'
+cc={version='*', features=['parallel']}
 
 [dependencies]
 bytemuck='*'
 drm-fourcc='*'
 drm='*'
-ffmpeg ={package='ffmpeg-sys-next', version='*'}
+#ffmpeg ={package='ffmpeg-sys-next', version='*'}

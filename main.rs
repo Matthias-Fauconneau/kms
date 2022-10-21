@@ -1,5 +1,5 @@
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use drm::{Device, control::{self, Device as _, dumbbuffer::DumbBuffer, *}, buffer::{DrmFourcc, Handle, Buffer, PlanarBuffer}};
+    /*use drm::{Device, control::{self, Device as _, dumbbuffer::DumbBuffer, *}, buffer::{DrmFourcc, Handle, Buffer, PlanarBuffer}};
     struct Card(std::fs::File);
     impl std::os::unix::io::AsRawFd for Card { fn as_raw_fd(&self) -> std::os::unix::io::RawFd { self.0.as_raw_fd() } }
     impl Device for Card {}
@@ -58,10 +58,9 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     atomic_req.add_property(plane, find_prop_id(&card, plane, "CRTC_X").expect("Could not get CRTC_X"), property::Value::SignedRange(0));
     atomic_req.add_property(plane, find_prop_id(&card, plane, "CRTC_Y").expect("Could not get CRTC_Y"), property::Value::SignedRange(0));
     atomic_req.add_property(plane, find_prop_id(&card, plane, "CRTC_W").expect("Could not get CRTC_W"), property::Value::UnsignedRange(mode.size().0 as u64));
-    atomic_req.add_property(plane, find_prop_id(&card, plane, "CRTC_H").expect("Could not get CRTC_H"), property::Value::UnsignedRange(mode.size().1 as u64));
+    atomic_req.add_property(plane, find_prop_id(&card, plane, "CRTC_H").expect("Could not get CRTC_H"), property::Value::UnsignedRange(mode.size().1 as u64));*/
 
     use ffmpeg::*;
-    unsafe {avdevice_register_all()};
     let path = std::env::args().skip(1).next().unwrap_or(std::env::var("HOME")?+"/input.mkv");
     #[track_caller] fn check(status: std::ffi::c_int) -> std::ffi::c_int { if status!=0 { let mut s=[0;AV_ERROR_MAX_STRING_SIZE]; unsafe{av_strerror(status,s.as_mut_ptr(),s.len());} panic!("{}", unsafe{std::ffi::CStr::from_ptr(s.as_ptr())}.to_str().unwrap()); } else { status } }
     let mut context = std::ptr::null_mut();
@@ -81,7 +80,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     check(unsafe{av_hwdevice_ctx_create(&mut hw_device_context, AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, std::ptr::null(), std::ptr::null_mut(), 0)});
     assert!(hw_device_context != std::ptr::null_mut());
     unsafe{&mut *decoder_context}.hw_device_ctx = unsafe{av_buffer_ref(hw_device_context)};
-    assert!(unsafe{&mut *decoder_context}.hw_device_ctx != std::ptr::null_mut());
     check(unsafe{avcodec_open2(decoder_context, decoder, std::ptr::null_mut())});
 
     let packet = unsafe{av_packet_alloc()};
@@ -91,7 +89,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             assert!(unsafe{&mut *decoder_context}.hwaccel != std::ptr::null());
             let mut frame = unsafe{av_frame_alloc()};
             let status = unsafe{avcodec_receive_frame(decoder_context, frame)};
-            if status == -EAGAIN { continue; }
+            break;
+            /*if status == -EAGAIN { continue; }
             check(status);
             let surface = unsafe{&*frame}.data[3] as u32; // VASurfaceID
 
@@ -102,14 +101,28 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             use va::*;
             #[track_caller] fn check(status: VAStatus) { if status!=0 { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(va::vaErrorStr(status))}); } }
 
-            let (va, context) = {
-                let hwaccel_priv_data = unsafe{&*((&*decoder_context).internal as *const va::AVCodecInternal)}.hwaccel_priv_data as *const VAAPIDecodeContext;
+            let context = unsafe{&*((&*(&mut *decoder_context).hw_device_ctx).data as *const AVHWDeviceContext)};
+            //let context = unsafe{&*((&*(&*frame).hw_frames_ctx).data as *const AVHWFramesContext)};
+            //let context = unsafe{&*(context.device_ctx.hwctx as *const AVVAAPIDeviceContext)};
+
+            let va = unsafe{*(context.hwctx as *const VADisplay)};*/
+            /*let context = {
+                let internal = dbg!(unsafe{&*((&*decoder_context).internal as *const va::AVCodecInternal)});
+                let fctx = internal.thread_ctx as *const FrameThreadContext;
+                assert!(!fctx.is_null());
+                let fctx = unsafe{&*fctx};
+                let hwaccel_priv_data = fctx.stash_hwaccel_priv as *const VAAPIDecodeContext;
+                //let hwaccel_priv_data = internal.hwaccel_priv_data as *const VAAPIDecodeContext;
                 assert!(!hwaccel_priv_data.is_null());
                 let hwaccel_priv_data = unsafe{&*hwaccel_priv_data};
                 dbg!(unsafe{*hwaccel_priv_data.hwctx}, hwaccel_priv_data.va_context)
-            };
+            };*/
+            /*let mut config = 0; // va::VAConfigID
+            check(unsafe{va::vaCreateConfig(va, VAProfile_VAProfileNone, VAEntrypoint_VAEntrypointVideoProc, std::ptr::null_mut(), 0, &mut config)});
+            let mut context = 0;
+            check(unsafe{va::vaCreateContext(va, config, width as _, height as _, 0 as _, [(); 0].as_ptr() as *mut _, 0, &mut context)});*/
 
-            let mut pipeline = VA_INVALID_ID;
+            /*let mut pipeline = VA_INVALID_ID;
             check(unsafe{vaCreateBuffer(va, context, VABufferType_VAProcPipelineParameterBufferType, std::mem::size_of::<VAProcPipelineParameterBuffer>() as _, 1, &VAProcPipelineParameterBuffer{surface,
                 ..Default::default()
             } as *const _ as *mut _, &mut pipeline as *mut _)});
@@ -122,7 +135,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut descriptor = va::VADRMPRIMESurfaceDescriptor::default();
             check(unsafe{va::vaExportSurfaceHandle(va, rgb, va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, va::VA_EXPORT_SURFACE_READ_ONLY | va::VA_EXPORT_SURFACE_SEPARATE_LAYERS, &mut descriptor as *mut _ as *mut _)});
 
-            unsafe{av_frame_free(&mut frame as *mut _)};
+            unsafe{av_frame_free(&mut frame as *mut _)};*/
             //if card.page_flip(crtc.handle(), fb, PageFlipFlags::empty(), None).is_ok() { println!("flip!"); } else { println!("no flip"); }
         }
         unsafe{av_packet_unref(packet)};
