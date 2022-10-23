@@ -4,7 +4,7 @@ fn from_iter_or<T: Copy, const N: usize>(iter: impl IntoIterator<Item=T>, v: T) 
 fn from_iter<T: Default, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] { from_iter_or_else(iter, || Default::default()) }
 fn array<T: Default, const N: usize>(len: usize, mut f: impl FnMut()->T) -> [T; N] { from_iter((0..len).map(|_| f())) }
 
-fn bytes_of<T>(t: &T) -> &[u8] { unsafe{std::slice::from_raw_parts(t as *const _ as *const u8, std::mem::size_of::<T>())} }
+fn bytes_of<T>(value: &T) -> &[u8] { unsafe{std::slice::from_raw_parts(value as *const _ as *const u8, std::mem::size_of::<T>())} }
 
 mod hevc;
 
@@ -99,7 +99,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         current_id: Option<va::VASurfaceID>,
     }
     let mut context = None;
-    let mut trace = Vec::new();//: Vec<(u32, Box<[u8]>)>,
+    let mut buffers = Vec::new();
+    let mut trace_buffers = Vec::new();//: Vec<(u32, Box<[u8]>)>,
     use hevc::*;
     HEVC::parse(&*input, |Slice{pps, sps, unit, slice_header, escaped_data,slice_data_byte_offset,dependent_slice_segment,slice_segment_address}, last_slice_of_picture: bool| {
         use itertools::Itertools;
@@ -116,8 +117,15 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         let frames = &mut context.frames;
         let reference = slice_header.reference.as_ref();
+
+        let mut render = {let context = context.context; let buffers = &mut buffers; let trace_buffers = &mut trace_buffers; move |r#type, data:&[u8]| {
+            let mut buffer = 0;
+            check(unsafe{va::vaCreateBuffer(va, context, r#type, data.len() as _, 1, data.as_ptr() as *const _ as *mut _, &mut buffer)});
+            buffers.push(buffer);
+            trace_buffers.push((r#type, data.to_owned().into_boxed_slice()));
+        }};
+
         let current_id = *context.current_id.get_or_insert_with(|| {
-            let context = context.context;
             let current_poc = reference.map(|r| r.poc).unwrap_or(0);
             //println!("POC {}", current_poc);
             //println!("DPB [{}]", frames.iter().filter_map(|f| f.poc).format(" "));
@@ -146,12 +154,11 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             }), va::VAPictureHEVC{picture_id:0xFFFFFFFF,pic_order_cnt:0,flags:va::VA_PICTURE_HEVC_INVALID,va_reserved:[0;_]}); // before setting current.poc
 
             let current = frames./*iter_mut().find(|f| f.poc.is_none())*/last_mut().unwrap();
-            println!("vaBeginPicture {}", current.id);
-            check(unsafe{va::vaBeginPicture(va, context, current.id)});
+            //println!("vaBeginPicture {}", current.id); check(unsafe{va::vaBeginPicture(va, context, current.id)});
             assert!(current.poc.is_none());
             current.poc = Some(current_poc); // after setting ReferenceFrames
 
-            let picture_parameter_buffer = va::VAPictureParameterBufferHEVC{
+            render(va::VABufferType_VAPictureParameterBufferType, bytes_of(&va::VAPictureParameterBufferHEVC{
                 CurrPic: va::VAPictureHEVC {
                     picture_id: current.id,
                     pic_order_cnt: current_poc as i32,
@@ -237,14 +244,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 row_height_minus1: pps.tiles.1.as_ref().map(|t| from_iter(t.rows.into_iter().map(|h| h-1))).unwrap_or_default(),
                 st_rps_bits: reference.map(|r| r.short_term_picture_set_encoded_bits_len_skip).flatten().unwrap_or(0),
                 va_reserved: [0; _]
-            };
-            let mut buffer = 0; //VABufferID
-            trace.push((va::VABufferType_VAPictureParameterBufferType, bytes_of(&picture_parameter_buffer).to_owned().into_boxed_slice()));
-            println!("vaCreateBuffer {} {}", va::VABufferType_VAPictureParameterBufferType, std::mem::size_of::<va::VAPictureParameterBufferHEVC>());
-            check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VAPictureParameterBufferType, std::mem::size_of::<va::VAPictureParameterBufferHEVC>() as std::ffi::c_uint, 1,
-                &picture_parameter_buffer as *const _ as *mut _, &mut buffer)});
-            //println!("vaRenderPicture");
-            check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
+            }));
             if let Some(_scaling_list) = pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()) {
                 unimplemented!();
                 /*let mut buffer = 0;
@@ -263,7 +263,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         let context = context.context;
         let prediction_weights = slice_header.inter.as_ref().map(|s| s.prediction_weights.clone()).flatten().unwrap_or_default();
-        let slice_parameter_buffer = {let sh=&slice_header; va::VASliceParameterBufferHEVC{
+        let sh=&slice_header;
+        render(va::VABufferType_VASliceParameterBufferType, bytes_of(&va::VASliceParameterBufferHEVC{
             slice_data_size: escaped_data.len() as u32,
             slice_data_offset: 0,
             slice_data_flag: va::VA_SLICE_DATA_FLAG_ALL,
@@ -326,20 +327,13 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             slice_data_num_emu_prevn_bytes: 0,
             va_reserved: [0; _],
             //..Default::default() // Zero initialize padding holes
-        }};
-        let mut buffer = 0;
-        println!("vaCreateBuffer {} {}", va::VABufferType_VASliceParameterBufferType, std::mem::size_of::<va::VASliceParameterBufferHEVC>());
-        trace.push((va::VABufferType_VASliceParameterBufferType, bytes_of(&slice_parameter_buffer).to_owned().into_boxed_slice()));
-        check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VASliceParameterBufferType, std::mem::size_of::<va::VASliceParameterBufferHEVC>() as u32, 1,
-            &slice_parameter_buffer as *const _ as *mut _, &mut buffer)});
-        //println!("vaRenderPicture");
-        check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
-        let mut buffer = 0;
-        println!("vaCreateBuffer {} {}", va::VABufferType_VASliceDataBufferType, escaped_data.len());
-        trace.push((va::VABufferType_VASliceDataBufferType, escaped_data.to_owned().into_boxed_slice()));
-        check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VASliceDataBufferType, escaped_data.len() as _, 1, escaped_data.as_ptr() as *const std::ffi::c_void as *mut _, &mut buffer)});
-        check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
+        }));
+        render(va::VABufferType_VASliceDataBufferType, escaped_data);
         if last_slice_of_picture {
+            println!("vaBeginPicture {}", current_id);
+            check(unsafe{va::vaBeginPicture(va, context, current_id)});
+            println!("{:?}", buffers);
+            check(unsafe{va::vaRenderPicture(va, context, buffers.as_ptr() as *const _ as *mut _, buffers.len() as _)});
             println!("vaEndPicture");
             check(unsafe{va::vaEndPicture(va, context)});
             #[repr(C)] struct VAAPIDecodeTraceBuffer {
@@ -348,7 +342,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 data: *const u8,
             }
             extern "C" { static vaapi_decode_trace_buffers : [VAAPIDecodeTraceBuffer; 17]; }
-            for (i, (a, b)) in trace.iter().zip(unsafe{&vaapi_decode_trace_buffers}).enumerate() {
+            for (i, (a, b)) in trace_buffers.iter().zip(unsafe{&vaapi_decode_trace_buffers}).enumerate() {
                 let r#type = a.0;
                 assert_eq!(r#type, b.r#type);
                 let a = &*a.1;
@@ -374,19 +368,19 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            panic!("sync");
+            dbg!("sync");
             check(unsafe{va::vaSyncSurface(va, current_id)});
             dbg!("OK");
 
-            let mut formats = unsafe{Box::new_uninit_slice(va::vaMaxNumImageFormats(va) as usize).assume_init()};
-            check(unsafe{va::vaQueryImageFormats(va, formats.as_mut_ptr(), &formats.len() as *const _ as *mut _)});
-            let format = formats.iter().find(|f| f.fourcc == va::VA_FOURCC_P010).unwrap();
-            //&va::VAImageFormat{fourcc: va::VA_FOURCC_P010, byte_order: va::VA_LSB_FIRST, bits_per_pixel: 24, depth: 0, red_mask: 0, green_mask: 0, blue_mask: 0, alpha_mask: 0, va_reserved: [0; _]}
+            //let mut formats = unsafe{Box::new_uninit_slice(va::vaMaxNumImageFormats(va) as usize).assume_init()};
+            //check(unsafe{va::vaQueryImageFormats(va, formats.as_mut_ptr(), &formats.len() as *const _ as *mut _)});
+            //let format = formats.iter().find(|f| f.fourcc == va::VA_FOURCC_P010).unwrap();
+            let ref format = va::VAImageFormat{fourcc: va::VA_FOURCC_P010, byte_order: va::VA_LSB_FIRST, bits_per_pixel: 24, depth: 0, red_mask: 0, green_mask: 0, blue_mask: 0, alpha_mask: 0, va_reserved: [0; _]};
             let mut image = va::VAImage{image_id: va::VA_INVALID_ID, ..Default::default()};
             use vector::xy;
             let size = dbg!(xy{x: sps.width as usize, y: sps.height as usize});
             dbg!("create");
-            check(unsafe{va::vaCreateImage(va, &dbg!(format) as *const _ as *mut _, sps.width as _, sps.height as _, &mut image)});
+            check(unsafe{va::vaCreateImage(va, dbg!(format) as *const _ as *mut _, sps.width as _, sps.height as _, &mut image)});
             dbg!("OK");
             check(unsafe{va::vaGetImage(va, current_id, 0, 0, sps.width as _, sps.height as _, image.image_id)});
             let mut address : *const u16 = std::ptr::null();
