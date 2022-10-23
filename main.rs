@@ -1,8 +1,10 @@
-#![allow(incomplete_features)]#![feature(int_log,generic_arg_infer,generic_const_exprs,array_zip,unchecked_math,array_methods)]
+#![allow(incomplete_features)]#![feature(int_log,generic_arg_infer,generic_const_exprs,array_zip,unchecked_math,array_methods,iter_array_chunks)]
 fn from_iter_or_else<T, const N: usize>(iter: impl IntoIterator<Item=T>, f: impl Fn() -> T+Copy) -> [T; N] { let mut iter = iter.into_iter(); [(); N].map(|_| iter.next().unwrap_or_else(f)) }
 fn from_iter_or<T: Copy, const N: usize>(iter: impl IntoIterator<Item=T>, v: T) -> [T; N] { from_iter_or_else(iter, || v) }
 fn from_iter<T: Default, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] { from_iter_or_else(iter, || Default::default()) }
 fn array<T: Default, const N: usize>(len: usize, mut f: impl FnMut()->T) -> [T; N] { from_iter((0..len).map(|_| f())) }
+
+fn bytes_of<T>(t: &T) -> &[u8] { unsafe{std::slice::from_raw_parts(t as *const _ as *const u8, std::mem::size_of::<T>())} }
 
 mod hevc;
 
@@ -12,11 +14,49 @@ mod va {
 }
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let trace = std::str::from_utf8(&std::fs::read("0")?)?.trim().split(' ').map(|x| u8::from_str_radix(x, 16).expect(x)).collect::<Box<_>>();
-    //println!("{:?}", unsafe{&*(trace.as_ptr() as *const va::VAPictureParameterBufferHEVC)});
-
     let path = std::env::args().skip(1).next().unwrap_or(std::env::var("HOME")?+"/input.mkv");
-    let input = unsafe{memmap::Mmap::map(&std::fs::File::open(path)?)}?;
+
+    {
+        mod av {
+            #![allow(dead_code,non_camel_case_types,non_upper_case_globals,improper_ctypes,non_snake_case)]
+            include!(concat!(env!("OUT_DIR"), "/av.rs"));
+        }
+        use av::*;
+
+        #[track_caller] fn check(status: std::ffi::c_int) -> std::ffi::c_int { if status!=0 { let mut s=[0;64]; unsafe{av_strerror(status,s.as_mut_ptr(),s.len());} panic!("{}", unsafe{std::ffi::CStr::from_ptr(s.as_ptr())}.to_str().unwrap()); } else { status } }
+        let mut context = std::ptr::null_mut();
+        let path = std::ffi::CString::new(path.clone()).unwrap();
+        check(unsafe{avformat_open_input(&mut context, path.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut())});
+        check(unsafe{avformat_find_stream_info(context, std::ptr::null_mut())});
+        let mut decoder = std::ptr::null();
+        let video_stream = check(unsafe{av_find_best_stream(context, AVMediaType_AVMEDIA_TYPE_VIDEO, -1, -1, &mut decoder as *mut _, 0)});
+        assert!(decoder != std::ptr::null_mut());
+        let video = &mut unsafe{&**(*context).streams.offset(video_stream as isize)};
+        let decoder_context = unsafe{avcodec_alloc_context3(decoder)};
+        check(unsafe{avcodec_parameters_to_context(decoder_context, video.codecpar)});
+        extern "C" fn get_format(_s: *mut AVCodecContext, _fmt: *const AVPixelFormat) -> AVPixelFormat { AVPixelFormat_AV_PIX_FMT_VAAPI  }
+        unsafe{&mut *decoder_context}.get_format  = Some(get_format);
+        let mut hw_device_context = std::ptr::null_mut();
+        check(unsafe{av_hwdevice_ctx_create(&mut hw_device_context, AVHWDeviceType_AV_HWDEVICE_TYPE_VAAPI, std::ptr::null(), std::ptr::null_mut(), 0)});
+        assert!(hw_device_context != std::ptr::null_mut());
+        unsafe{&mut *decoder_context}.hw_device_ctx = unsafe{av_buffer_ref(hw_device_context)};
+        check(unsafe{avcodec_open2(decoder_context, decoder, std::ptr::null_mut())});
+
+        let packet = unsafe{av_packet_alloc()};
+        while unsafe{av_read_frame(context, packet)} >= 0 {
+            if video_stream == unsafe{&*packet}.stream_index {
+                check(unsafe{avcodec_send_packet(decoder_context, packet)});
+                assert!(unsafe{&mut *decoder_context}.hwaccel != std::ptr::null());
+                let frame = unsafe{av_frame_alloc()};
+                unsafe{av_log_set_level(AV_LOG_TRACE as _)};
+                let _status = unsafe{avcodec_receive_frame(decoder_context, frame)};
+                break;
+            }
+            unsafe{av_packet_unref(packet)};
+        }
+    }
+
+    let input = unsafe{memmap::Mmap::map(&std::fs::File::open(&path)?)}?;
 
     struct Card(std::fs::File);
     let card = Card(std::fs::OpenOptions::new().read(true).write(true).open("/dev/dri/card0").unwrap());
@@ -27,7 +67,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let va = unsafe{va::vaGetDisplayDRM(card.0.as_raw_fd())};
     extern "C" fn error(_user_context: *mut std::ffi::c_void, message: *const std::ffi::c_char) { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(message)}) }
     unsafe{va::vaSetErrorCallback(va, Some(error), std::ptr::null_mut())};
-    extern "C" fn info(_user_context: *mut std::ffi::c_void, message: *const std::ffi::c_char) { println!("{:?}", unsafe{std::ffi::CStr::from_ptr(message)}); }
+    extern "C" fn info(_user_context: *mut std::ffi::c_void, _message: *const std::ffi::c_char) { /*println!("{:?}", unsafe{std::ffi::CStr::from_ptr(message)});*/ }
     unsafe{va::vaSetInfoCallback(va,  Some(info),  std::ptr::null_mut())};
     let (mut major, mut minor) = (0,0);
     #[track_caller] fn check(status: va::VAStatus) { if status!=0 { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(va::vaErrorStr(status))}); } }
@@ -43,7 +83,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     struct Sequence {
         frames: [Frame; 16],
         context: va::VAContextID,
-        current_id: Option<va::VASurfaceID>
+        current_id: Option<va::VASurfaceID>,
+        trace: Vec<(u32, Box<[u8]>)>,
     }
     hevc::parse(&*input, |sps:&hevc::SPS| {
         let mut ids = [0; 16];
@@ -52,22 +93,42 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut context = 0;
         println!("vaCreateContext {} {} {} {}", sps.width, sps.height, "VA_PROGRESSIVE", 16);
         check(unsafe{va::vaCreateContext(va, config, sps.width as _, sps.height as _, va::VA_PROGRESSIVE as _, ids.as_ptr() as *mut _, ids.len() as _, &mut context)});
-        Sequence{context, frames: ids.map(|id| Frame{id, poc: None}), current_id: None}
+        Sequence{context, frames: ids.map(|id| Frame{id, poc: None}), current_id: None, trace: Vec::new()}
     },
-    |Sequence{context,frames,current_id}, pps, sps, unit, reference| {
+    |Sequence{context,frames,current_id,trace}, pps, sps, unit, reference| {
         let context = *context;
         let current_poc = reference.map(|r| r.poc).unwrap_or(0);
-        println!("POC {}", current_poc);
-        println!("DPB [{}]", frames.iter().filter_map(|f| f.poc).format(" "));
-        reference.map(|r| println!("refs [{}]", r.short_term_pictures.iter().map(|p| (current_poc as i8+p.delta_poc) as u8).chain(r.long_term_pictures.iter().map(|p| p.poc)).format(" ")));
+        //println!("POC {}", current_poc);
+        //println!("DPB [{}]", frames.iter().filter_map(|f| f.poc).format(" "));
+        reference.map(|r| println!("refs [{}]", r.short_term_pictures.iter().map(|p| (current_poc as i8+p.delta_poc) as u8).chain(r.long_term_pictures.iter().map(|p| p.poc)).format("")));
         for Frame{poc: frame_poc,..} in frames.iter_mut() {
             *frame_poc = frame_poc.filter(|&frame_poc| reference.map(|r| r.short_term_pictures.iter().any(|p| ((current_poc as i8+p.delta_poc) as u8) == frame_poc) || r.long_term_pictures.iter().any(|p| p.poc == frame_poc)).unwrap_or(false));
         }
+
+        #[allow(non_snake_case)] let ReferenceFrames = from_iter_or(frames.iter().filter_map(|frame| {
+            let frame_poc = frame.poc?;
+            Some(va::VAPictureHEVC{
+                picture_id: frame.id,
+                pic_order_cnt: frame_poc as i32,
+                flags: reference.map(|r|
+                    r.short_term_pictures.iter().filter_map(|&hevc::ShortTermReferencePicture{delta_poc, used}| used.then(|| (current_poc as i8+delta_poc) as u8)).find(|&poc| poc == frame_poc).map(|poc|
+                        match poc.cmp(&current_poc) {
+                            std::cmp::Ordering::Less => va::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE,
+                            std::cmp::Ordering::Greater => va::VA_PICTURE_HEVC_RPS_ST_CURR_AFTER,
+                            _ => unreachable!()
+                        }
+                    ).unwrap_or(0) |
+                    if r.long_term_pictures.iter().any(|&hevc::LongTermReferencePicture{poc, used}| used && poc == frame_poc) { va::VA_PICTURE_HEVC_RPS_LT_CURR } else {0}
+                ).unwrap_or(0),
+                va_reserved:[0;_]
+            })
+        }), va::VAPictureHEVC{picture_id:0xFFFFFFFF,pic_order_cnt:0,flags:va::VA_PICTURE_HEVC_INVALID,va_reserved:[0;_]}); // before setting current.poc
+
         let current = frames.iter_mut().find(|f| f.poc.is_none()).unwrap();
         println!("vaBeginPicture {}", current.id);
         check(unsafe{va::vaBeginPicture(va, context, current.id)});
         *current_id = Some(current.id);
-        current.poc = Some(current_poc);
+        current.poc = Some(current_poc); // after setting ReferenceFrames
 
         let picture_parameter_buffer = va::VAPictureParameterBufferHEVC{
             CurrPic: va::VAPictureHEVC {
@@ -76,24 +137,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 flags: 0,
                 va_reserved: [0; 4],
             },
-            ReferenceFrames: from_iter_or(frames.iter().filter_map(|frame| {
-                let frame_poc = frame.poc?;
-                Some(va::VAPictureHEVC{
-                    picture_id: frame.id,
-                    pic_order_cnt: frame_poc as i32,
-                    flags: reference.map(|r|
-                        r.short_term_pictures.iter().filter_map(|&hevc::ShortTermReferencePicture{delta_poc, used}| used.then(|| (current_poc as i8+delta_poc) as u8)).find(|&poc| poc == frame_poc).map(|poc|
-                            match poc.cmp(&current_poc) {
-                                std::cmp::Ordering::Less => va::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE,
-                                std::cmp::Ordering::Greater => va::VA_PICTURE_HEVC_RPS_ST_CURR_AFTER,
-                                _ => unreachable!()
-                            }
-                        ).unwrap_or(0) |
-                        if r.long_term_pictures.iter().any(|&hevc::LongTermReferencePicture{poc, used}| used && poc == frame_poc) { va::VA_PICTURE_HEVC_RPS_LT_CURR } else {0}
-                    ).unwrap_or(0),
-                    va_reserved:[0;_]
-                })
-            }), va::VAPictureHEVC{picture_id:0xFFFFFFFF,pic_order_cnt:0,flags:va::VA_PICTURE_HEVC_INVALID,va_reserved:[0;_]}),
+            ReferenceFrames,
             pic_width_in_luma_samples: sps.width,
             pic_height_in_luma_samples: sps.height,
             pic_fields: va::_VAPictureParameterBufferHEVC__bindgen_ty_1{bits: va::_VAPictureParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1{_bitfield_align_1: [], _bitfield_1:
@@ -174,14 +218,15 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             va_reserved: [0; _]
         };
         let mut buffer = 0; //VABufferID
-        println!("vaCreateBuffer {}\n{:?}", va::VABufferType_VAPictureParameterBufferType, &"picture_parameter_buffer");
+        trace.push((va::VABufferType_VAPictureParameterBufferType, bytes_of(&picture_parameter_buffer).to_owned().into_boxed_slice()));
+        println!("vaCreateBuffer {} {}", va::VABufferType_VAPictureParameterBufferType, std::mem::size_of::<va::VAPictureParameterBufferHEVC>());
         check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VAPictureParameterBufferType, std::mem::size_of::<va::VAPictureParameterBufferHEVC>() as std::ffi::c_uint, 1,
             &picture_parameter_buffer as *const _ as *mut _, &mut buffer)});
-        println!("vaRenderPicture");
+        //println!("vaRenderPicture");
         check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
-        if let Some(scaling_list) = pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()) {
+        if let Some(_scaling_list) = pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()) {
             unimplemented!();
-            let mut buffer = 0;
+            /*let mut buffer = 0;
             check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VAIQMatrixBufferType, std::mem::size_of::<va::VAIQMatrixBufferHEVC> as u32, 1, &mut va::VAIQMatrixBufferHEVC{
                 ScalingList4x4: scaling_list.x4,
                 ScalingList8x8: scaling_list.x8,
@@ -191,10 +236,10 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ScalingList32x32: scaling_list.x32.map(|x| x.1),
                 va_reserved: [0; _],
             } as *const _ as *mut _, &mut buffer)});
-            check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
+            check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});*/
         }
     },
-    |Sequence{context,frames,..}, sh, data, slice_data_byte_offset, (dependent_slice_segment, slice_segment_address)| {
+    |Sequence{context,frames,trace,..}, sh, data, slice_data_byte_offset, (dependent_slice_segment, slice_segment_address)| {
         let prediction_weights = sh.inter.as_ref().map(|s| s.prediction_weights.clone()).flatten().unwrap_or_default();
         let slice_parameter_buffer = va::VASliceParameterBufferHEVC{
             slice_data_size: data.len() as u32,
@@ -202,40 +247,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             slice_data_flag: va::VA_SLICE_DATA_FLAG_ALL,
             slice_data_byte_offset: slice_data_byte_offset as _,
             slice_segment_address: slice_segment_address.unwrap_or(0) as u32,
-            slice_qp_delta: sh.qp_delta,
-            slice_cb_qp_offset: sh.qp_offsets.map(|o| o.0).unwrap_or(0),
-            slice_cr_qp_offset: sh.qp_offsets.map(|o| o.1).unwrap_or(0),
-            slice_beta_offset_div2: sh.deblocking_filter.as_ref().map(|f| f.beta_offset / 2).unwrap_or(0),
-            slice_tc_offset_div2: sh.deblocking_filter.as_ref().map(|f| f.tc_offset / 2).unwrap_or(0),
-            collocated_ref_idx: sh.inter.as_ref().map(|i| i.collocated_list.map(|(_,index)| index.unwrap_or(0))).flatten().unwrap_or(0xFF),
-            five_minus_max_num_merge_cand: sh.inter.as_ref().map(|s| 5 - s.max_num_merge_cand).unwrap_or(0),
-            num_ref_idx_l0_active_minus1: sh.inter.as_ref().map(|s| s.active_references.p-1).unwrap_or(0) as u8,
-            num_ref_idx_l1_active_minus1: sh.inter.as_ref().map(|s| s.active_references.b.map(|len| len-1)).flatten().unwrap_or(0) as u8,
-            LongSliceFlags: va::_VASliceParameterBufferHEVC__bindgen_ty_1{fields: va::_VASliceParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1{_bitfield_align_1: [], _bitfield_1: va::_VASliceParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1::new_bitfield_1(
-                /*LastSliceOfPic*/0,
-                dependent_slice_segment as _,
-                sh.slice_type as u32,
-                sh.color_plane_id as u32,
-                sh.sample_adaptive_offset.luma as _,
-                sh.sample_adaptive_offset.chroma.unwrap_or(false) as _,
-                sh.inter.as_ref().map(|i| i.mvd_l1_zero).unwrap_or(false) as _,
-                sh.inter.as_ref().map(|i| i.cabac_init).unwrap_or(false) as _,
-                sh.reference.as_ref().map(|i| i.temporal_motion_vector_predictor).unwrap_or(false) as _,
-                sh.deblocking_filter.is_none() as _,
-                sh.inter.as_ref().map(|i| i.collocated_list.map(|(collocated,_)| !collocated)).flatten().unwrap_or(false) as _,
-                sh.loop_filter_across_slices as _,
-                /*reserved*/ 0
-            )}},
-            luma_log2_weight_denom: prediction_weights.luma.log2_denom_weight,
-            delta_chroma_log2_weight_denom: prediction_weights.chroma.as_ref().map(|c| c.log2_denom_weight as i8 - prediction_weights.luma.log2_denom_weight as i8).unwrap_or(0),
-            delta_luma_weight_l0: prediction_weights.luma.pb.p.weight,
-            delta_chroma_weight_l0: prediction_weights.chroma.clone().unwrap_or_default().pb.p.weight,
-            luma_offset_l0: prediction_weights.luma.pb.p.offset,
-            ChromaOffsetL0: prediction_weights.chroma.clone().unwrap_or_default().pb.p.offset,
-            delta_luma_weight_l1: prediction_weights.luma.pb.b.unwrap_or_default().weight,
-            delta_chroma_weight_l1: prediction_weights.chroma.clone().unwrap_or_default().pb.b.unwrap_or_default().weight,
-            luma_offset_l1: prediction_weights.luma.pb.b.unwrap_or_default().offset,
-            ChromaOffsetL1: prediction_weights.chroma.unwrap_or_default().pb.b.unwrap_or_default().offset,
             RefPicList: sh.reference.as_ref().map(|r| {
                 fn index(frames: &[Frame], ref_poc: u8) -> u8 { frames.iter().filter_map(|frame| frame.poc).position(|poc| poc == ref_poc).unwrap_or_else(|| panic!("Missing {ref_poc}")) as u8 }
                 pub fn list<T>(iter: impl std::iter::IntoIterator<Item=T>) -> Box<[T]> { iter.into_iter().collect() }
@@ -252,29 +263,67 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let stps_before = stps(frames, r, |o| o.reverse());
                 let ltps = map(sort_by(list(r.long_term_pictures.into_iter().filter_map(|&hevc::LongTermReferencePicture{poc, used}| used.then(|| poc))), Ord::cmp).into_iter(), |&poc| index(frames, poc));
                 [ from_iter([&*stps_before, &*stps_after, &*ltps].into_iter().flatten().copied()), from_iter([&*stps_after, &*stps_before, &*ltps].into_iter().flatten().copied())]
-            }).unwrap_or_default(),
+            }).unwrap_or([[0xFF; _]; _]),
+            LongSliceFlags: va::_VASliceParameterBufferHEVC__bindgen_ty_1{fields: va::_VASliceParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1{_bitfield_align_1: [], _bitfield_1: va::_VASliceParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1::new_bitfield_1(
+                /*LastSliceOfPic*/0,
+                dependent_slice_segment as _,
+                sh.slice_type as u32,
+                sh.color_plane_id as u32,
+                sh.sample_adaptive_offset.luma as _,
+                sh.sample_adaptive_offset.chroma.unwrap_or(false) as _,
+                sh.inter.as_ref().map(|i| i.mvd_l1_zero).unwrap_or(false) as _,
+                sh.inter.as_ref().map(|i| i.cabac_init).unwrap_or(false) as _,
+                sh.reference.as_ref().map(|i| i.temporal_motion_vector_predictor).unwrap_or(false) as _,
+                sh.deblocking_filter.is_none() as _,
+                sh.inter.as_ref().map(|i| i.collocated_list.map(|(collocated,_)| !collocated)).flatten().unwrap_or(true) as _,
+                sh.loop_filter_across_slices as _,
+                /*reserved*/ 0
+            )}},
+            slice_qp_delta: sh.qp_delta,
+            slice_cb_qp_offset: sh.qp_offsets.map(|o| o.0).unwrap_or(0),
+            slice_cr_qp_offset: sh.qp_offsets.map(|o| o.1).unwrap_or(0),
+            slice_beta_offset_div2: sh.deblocking_filter.as_ref().map(|f| f.beta_offset / 2).unwrap_or(0),
+            slice_tc_offset_div2: sh.deblocking_filter.as_ref().map(|f| f.tc_offset / 2).unwrap_or(0),
+            collocated_ref_idx: sh.inter.as_ref().map(|i| i.collocated_list.map(|(_,index)| index.unwrap_or(0))).flatten().unwrap_or(0xFF),
+            five_minus_max_num_merge_cand: sh.inter.as_ref().map(|s| 5 - s.max_num_merge_cand).unwrap_or(0),
+            num_ref_idx_l0_active_minus1: sh.inter.as_ref().map(|s| s.active_references.p-1).unwrap_or(0) as u8,
+            num_ref_idx_l1_active_minus1: sh.inter.as_ref().map(|s| s.active_references.b.map(|len| len-1)).flatten().unwrap_or(0) as u8,
+            luma_log2_weight_denom: prediction_weights.luma.log2_denom_weight,
+            delta_chroma_log2_weight_denom: prediction_weights.chroma.as_ref().map(|c| c.log2_denom_weight as i8 - prediction_weights.luma.log2_denom_weight as i8).unwrap_or(0),
+            delta_luma_weight_l0: prediction_weights.luma.pb.p.weight,
+            delta_chroma_weight_l0: prediction_weights.chroma.clone().unwrap_or_default().pb.p.weight,
+            luma_offset_l0: prediction_weights.luma.pb.p.offset,
+            ChromaOffsetL0: prediction_weights.chroma.clone().unwrap_or_default().pb.p.offset,
+            delta_luma_weight_l1: prediction_weights.luma.pb.b.unwrap_or_default().weight,
+            delta_chroma_weight_l1: prediction_weights.chroma.clone().unwrap_or_default().pb.b.unwrap_or_default().weight,
+            luma_offset_l1: prediction_weights.luma.pb.b.unwrap_or_default().offset,
+            ChromaOffsetL1: prediction_weights.chroma.unwrap_or_default().pb.b.unwrap_or_default().offset,
             num_entry_point_offsets: 0,
             entry_offset_to_subset_array: 0,
             slice_data_num_emu_prevn_bytes: 0,
-            va_reserved: [0; _]
+            va_reserved: [0; _],
+            ..Default::default() // Zero initialize padding holes
         };
         let context = *context;
         let mut buffer = 0;
-        println!("vaCreateBuffer {} {:?}", va::VABufferType_VASliceParameterBufferType, &"slice_parameter_buffer");
+        println!("vaCreateBuffer {} {}", va::VABufferType_VASliceParameterBufferType, std::mem::size_of::<va::VASliceParameterBufferHEVC>());
+        trace.push((va::VABufferType_VASliceParameterBufferType, bytes_of(&slice_parameter_buffer).to_owned().into_boxed_slice()));
         check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VASliceParameterBufferType, std::mem::size_of::<va::VASliceParameterBufferHEVC>() as u32, 1,
             &slice_parameter_buffer as *const _ as *mut _, &mut buffer)});
-        println!("vaRenderPicture");
+        //println!("vaRenderPicture");
         check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
         let mut buffer = 0;
-        println!("vaCreateBuffer {} {:?}", va::VABufferType_VASliceDataBufferType, data);
+        println!("vaCreateBuffer {} {}", va::VABufferType_VASliceDataBufferType, data.len());
+        trace.push((va::VABufferType_VASliceDataBufferType, bytes_of(&slice_parameter_buffer).to_owned().into_boxed_slice()));
         check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VASliceDataBufferType, data.len() as _, 1, data.as_ptr() as *const std::ffi::c_void as *mut _, &mut buffer)});
         check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
     },
-    |&Sequence{context, current_id,..}| {
+    |Sequence{context, current_id,trace,..}| {
+        let context = *context;
         println!("vaEndPicture");
         check(unsafe{va::vaEndPicture(va, context)});
         let mut descriptor = va::VADRMPRIMESurfaceDescriptor::default();
-        println!("export {}", current_id.unwrap());
+        //println!("export {}", current_id.unwrap());
         check(unsafe{va::vaExportSurfaceHandle(va, current_id.unwrap(), va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, va::VA_EXPORT_SURFACE_READ_ONLY | va::VA_EXPORT_SURFACE_SEPARATE_LAYERS, &mut descriptor as *mut _ as *mut _)});
         use vector::xy;
         let size = xy{x: descriptor.width, y: descriptor.height};
@@ -282,8 +331,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fd = unsafe{std::os::unix::io::FromRawFd::from_raw_fd(descriptor.objects[0].fd)};
             use image::Image;
             struct Widget (Image<rustix::io::OwnedFd>);
-            impl ui::Widget for Widget { fn paint(&mut self, target: &mut ui::Target, _: ui::size, _: ui::int2) -> ui::Result<()> {
-                let fd = &self.0.data;
+            impl ui::Widget for Widget { fn paint(&mut self, _target: &mut ui::Target, _: ui::size, _: ui::int2) -> ui::Result<()> {
+                panic!();/*let fd = &self.0.data;
                 let map = unsafe{memmap::Mmap::map(fd).unwrap()};
                 const DMA_BUF_BASE: u8 = b'b';
                 const DMA_BUF_IOCTL_SYNC: u8 = 0;
@@ -292,7 +341,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 nix::ioctl_write_ptr!(dma_buf_ioctl_sync, DMA_BUF_BASE, DMA_BUF_IOCTL_SYNC, u64);
                 let fd = fd.as_raw_fd();
                 println!("sync");
-                panic!();
                 unsafe{dma_buf_ioctl_sync(fd, &DMA_BUF_SYNC_READ as *const _)}.unwrap();
                 println!("OK");
                 let frame = Image::<&[u16]>::cast_slice(&map[0..self.0.size.y as usize*self.0.size.x as usize*std::mem::size_of::<u16>()], self.0.size);
@@ -300,8 +348,47 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dbg!(self.0.size);
                 for y in 0..min(frame.size.y, target.size.y) { for x in 0..min(frame.size.x, target.size.x) { target[xy{x,y}] = (((frame[xy{x,y}] as u32+0x80)/0x101) as u8).into(); }}
                 unsafe{dma_buf_ioctl_sync(fd, &(DMA_BUF_SYNC_READ|DMA_BUF_SYNC_END) as *const _)}.unwrap();
-                Ok(())
+                Ok(())*/
             } }
+            //let trace = std::str::from_utf8(&std::fs::read("0")?)?.trim().split(' ').map(|x| u8::from_str_radix(x, 16).expect(x)).collect::<Box<_>>();
+            //println!("{:?}", unsafe{&*(trace.as_ptr() as *const va::VAPictureParameterBufferHEVC)});
+            /*let a = String::from_utf8(std::fs::read("a").unwrap()).unwrap();
+            //let [a,b] = ["a","b"].map(|x| String::from_utf8(std::fs::read(x).unwrap()).unwrap());
+            for chunk in a.chars().zip(trace.chars()).array_chunks::<32>() {
+                let (a,b) = chunk.iter().map(|(a,b)| { let f = if a==b { "\x1b[0m" } else { "\x1b[31m" }.to_string(); (f.clone()+a.to_string().as_str(), f+b.to_string().as_str()) }).unzip::<_,_,Vec<_>,Vec<_>>();
+                println!("{}", a.iter().format(""));
+                println!("{}", b.iter().format(""));
+                println!("");
+            }*/
+            //return Ok(());
+            #[repr(C)] struct VAAPIDecodeTraceBuffer {
+                r#type: u32,
+                len: usize,
+                data: *const u8,
+            }
+            extern "C" { static vaapi_decode_trace_buffers : [VAAPIDecodeTraceBuffer; 17]; }
+            for (i, (a, b)) in trace.iter().zip(unsafe{&vaapi_decode_trace_buffers}).enumerate() {
+                let r#type = a.0;
+                assert_eq!(r#type, b.r#type);
+                let a = &*a.1;
+                let b = unsafe{std::slice::from_raw_parts(b.data, b.len)};
+                if a != b {
+                    println!("#{i} {}", r#type);
+                    for chunk in a.iter().zip(b).array_chunks::<64>() {
+                        let (a,b) = chunk.iter().map(|(a,b)| { let f = if a==b { "\x1b[0m" } else { "\x1b[31m" }.to_string(); (f.clone()+&format!("{a:02x}"), f+&format!("{b:02x}")) }).unzip::<_,_,Vec<_>,Vec<_>>();
+                        println!("+ {}", a.iter().format(""));
+                        println!("- {}", b.iter().format(""));
+                    }
+                    if i>0 {
+                        let a = unsafe{&*(a.as_ptr() as *const va::VASliceParameterBufferHEVC)};
+                        let b = unsafe{&*(b.as_ptr() as *const va::VASliceParameterBufferHEVC)};
+                        println!("{:0b}", unsafe{a.LongSliceFlags.value});
+                        println!("{:0b}", unsafe{b.LongSliceFlags.value});
+                        panic!();
+                    }
+                }
+            }
+
             ui::run(&mut Widget(Image{data: fd, size, stride: size.x})).unwrap();
             panic!("OK");
         }
@@ -368,90 +455,5 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     atomic_req.add_property(plane, find_prop_id(&card, plane, "CRTC_W").expect("Could not get CRTC_W"), property::Value::UnsignedRange(mode.size().0 as u64));
     atomic_req.add_property(plane, find_prop_id(&card, plane, "CRTC_H").expect("Could not get CRTC_H"), property::Value::UnsignedRange(mode.size().1 as u64));*/
 
-    /*mod av {
-        #![allow(dead_code,non_camel_case_types,non_upper_case_globals,improper_ctypes,non_snake_case)]
-        include!(concat!(env!("OUT_DIR"), "/av.rs"));
-    }
-    use av::*;
-    let path = std::env::args().skip(1).next().unwrap_or(std::env::var("HOME")?+"/input.mkv");
-    #[track_caller] fn check(status: std::ffi::c_int) -> std::ffi::c_int { if status!=0 { let mut s=[0;64]; unsafe{av_strerror(status,s.as_mut_ptr(),s.len());} panic!("{}", unsafe{std::ffi::CStr::from_ptr(s.as_ptr())}.to_str().unwrap()); } else { status } }
-    let mut context = std::ptr::null_mut();
-    let path = std::ffi::CString::new(path).unwrap();
-    check(unsafe{avformat_open_input(&mut context, path.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut())});
-    check(unsafe{avformat_find_stream_info(context, std::ptr::null_mut())});
-    let mut decoder = std::ptr::null();
-    let video_stream = check(unsafe{av_find_best_stream(context, AVMediaType_AVMEDIA_TYPE_VIDEO, -1, -1, &mut decoder as *mut _, 0)});
-    assert!(decoder != std::ptr::null_mut());
-    let video = &mut unsafe{&**(*context).streams.offset(video_stream as isize)};
-    let decoder_context = unsafe{avcodec_alloc_context3(decoder)};
-    check(unsafe{avcodec_parameters_to_context(decoder_context, video.codecpar)});
-    extern "C" fn get_format(_s: *mut AVCodecContext, _fmt: *const AVPixelFormat) -> AVPixelFormat { AVPixelFormat_AV_PIX_FMT_VAAPI  }
-    unsafe{&mut *decoder_context}.get_format  = Some(get_format);
-    let mut hw_device_context = std::ptr::null_mut();
-    check(unsafe{av_hwdevice_ctx_create(&mut hw_device_context, AVHWDeviceType_AV_HWDEVICE_TYPE_VAAPI, std::ptr::null(), std::ptr::null_mut(), 0)});
-    assert!(hw_device_context != std::ptr::null_mut());
-    unsafe{&mut *decoder_context}.hw_device_ctx = unsafe{av_buffer_ref(hw_device_context)};
-    check(unsafe{avcodec_open2(decoder_context, decoder, std::ptr::null_mut())});
-
-    let packet = unsafe{av_packet_alloc()};
-    while unsafe{av_read_frame(context, packet)} >= 0 {
-        if video_stream == unsafe{&*packet}.stream_index {
-            check(unsafe{avcodec_send_packet(decoder_context, packet)});
-            assert!(unsafe{&mut *decoder_context}.hwaccel != std::ptr::null());
-            let mut frame = unsafe{av_frame_alloc()};
-            unsafe{av_log_set_level(AV_LOG_TRACE as _)};
-            let status = unsafe{avcodec_receive_frame(decoder_context, frame)};
-            break;
-            /*if status == -libc::EAGAIN { continue; }
-            check(status);
-            let surface = unsafe{&*frame}.data[3] as u32; // VASurfaceID
-
-            mod va {
-                #![allow(dead_code,non_camel_case_types,non_upper_case_globals,improper_ctypes,non_snake_case)]
-                include!(concat!(env!("OUT_DIR"), "/va.rs"));
-            }
-            use va::*;
-            #[track_caller] fn check(status: VAStatus) { if status!=0 { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(va::vaErrorStr(status))}); } }
-
-            let context = unsafe{&*((&*(&mut *decoder_context).hw_device_ctx).data as *const AVHWDeviceContext)};
-            //let context = unsafe{&*((&*(&*frame).hw_frames_ctx).data as *const AVHWFramesContext)};
-            //let context = unsafe{&*(context.device_ctx.hwctx as *const AVVAAPIDeviceContext)};
-
-            let va = unsafe{*(context.hwctx as *const VADisplay)};
-            let context = {
-                let internal = dbg!(unsafe{&*((&*decoder_context).internal as *const av::AVCodecInternal)});
-                /*let fctx = internal.thread_ctx as *const FrameThreadContext;
-                assert!(!fctx.is_null());
-                let fctx = unsafe{&*fctx};
-                let hwaccel_priv_data = fctx.stash_hwaccel_priv as *const VAAPIDecodeContext;*/
-                let hwaccel_priv_data = internal.hwaccel_priv_data as *const VAAPIDecodeContext;
-                assert!(!hwaccel_priv_data.is_null());
-                let hwaccel_priv_data = unsafe{&*hwaccel_priv_data};
-                dbg!(unsafe{*hwaccel_priv_data.hwctx}, hwaccel_priv_data.va_context)
-            };
-            /*let mut config = 0; // va::VAConfigID
-            check(unsafe{va::vaCreateConfig(va, VAProfile_VAProfileNone, VAEntrypoint_VAEntrypointVideoProc, std::ptr::null_mut(), 0, &mut config)});
-            let mut context = 0;
-            check(unsafe{va::vaCreateContext(va, config, width as _, height as _, 0 as _, [(); 0].as_ptr() as *mut _, 0, &mut context)});*/
-
-            /*let mut pipeline = VA_INVALID_ID;
-            check(unsafe{vaCreateBuffer(va, context, VABufferType_VAProcPipelineParameterBufferType, std::mem::size_of::<VAProcPipelineParameterBuffer>() as _, 1, &VAProcPipelineParameterBuffer{surface,
-                ..Default::default()
-            } as *const _ as *mut _, &mut pipeline as *mut _)});
-            let mut rgb = VA_INVALID_SURFACE;
-            check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_YUV420_10, width as _, height as _, &mut rgb as *mut _, 1, std::ptr::null_mut(), 0)});
-            check(unsafe{vaBeginPicture(va, context, rgb)});
-            check(unsafe{vaRenderPicture(va, context, &pipeline as *const _ as *mut _, 1)});
-            check(unsafe{vaEndPicture(va, context)});
-
-            let mut descriptor = va::VADRMPRIMESurfaceDescriptor::default();
-            check(unsafe{va::vaExportSurfaceHandle(va, rgb, va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, va::VA_EXPORT_SURFACE_READ_ONLY | va::VA_EXPORT_SURFACE_SEPARATE_LAYERS, &mut descriptor as *mut _ as *mut _)});
-
-            unsafe{av_frame_free(&mut frame as *mut _)};*/
-            //if card.page_flip(crtc.handle(), fb, PageFlipFlags::empty(), None).is_ok() { println!("flip!"); } else { println!("no flip"); }*/
-        }
-        unsafe{av_packet_unref(packet)};
-    }
-    //card.destroy_framebuffer(fb).unwrap(); card.destroy_dumb_buffer(db).unwrap();*/
     Ok(())
 }

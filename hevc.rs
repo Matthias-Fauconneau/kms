@@ -48,7 +48,7 @@ fn profile_tier_level(s: &mut Reader, max_layers: usize) {
     let _level_idc = s.u8();
     if max_layers > 1 {
         let layers : [_; 8] = std::array::from_fn(|_| (s.bit(), s.bit()));
-        println!("{layers:?}");
+        //println!("{layers:?}");
         let _layers = layers.map(|(profile, level)| {
             if profile { s.skip(44); s.skip(43); }
             if level { s.u8(); }
@@ -265,7 +265,7 @@ pub struct SliceHeader {
     pub loop_filter_across_slices: bool,
 }
 
-pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: impl FnMut(&mut S, &PPS, &SPS, NAL, Option<&SHReference>), mut slice: impl FnMut(&S, &SliceHeader, &[u8], usize, (bool, Option<usize>)), mut end_cluster: impl FnMut(&S)) {
+pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: impl FnMut(&mut S, &PPS, &SPS, NAL, Option<&SHReference>), mut slice: impl FnMut(&mut S, &SliceHeader, &[u8], usize, (bool, Option<usize>)), mut end_cluster: impl FnMut(&S)) {
 	let ref mut parse_nal = {
     let mut vps : [_; 16] = Default::default();
 	let mut sps : [_; 16] = Default::default();
@@ -324,9 +324,9 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 					let _active_video_parameter_set_id = s.bits(4);
 					let _self_contained_cvs = s.bit();
 					let _no_parameter_set_update = s.bit();
-					let num_sps_ids = s.exp_golomb_code();
-					let active_seq_parameter_set_id = s.ue();
-					println!("active parameter sets: {_active_video_parameter_set_id} {_self_contained_cvs} {_no_parameter_set_update} {num_sps_ids} {active_seq_parameter_set_id}");
+					let _num_sps_ids = s.exp_golomb_code();
+					let _active_seq_parameter_set_id = s.ue();
+					//println!("active parameter sets: {_active_video_parameter_set_id} {_self_contained_cvs} {_no_parameter_set_update} {num_sps_ids} {active_seq_parameter_set_id}");
 				}
 				USER_DATA_UNREGISTERED => {},
 				MASTERING_DISPLAY_INFO => {},
@@ -337,9 +337,9 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 				_ => panic!("SEI {sei_type:}"),
 			}
 		}
-		NAL::AUD => println!("AUD {data:?}"),
+		NAL::AUD => {}//println!("AUD {data:?}"),
 		NAL::VPS => {
-			println!("VPS");
+			//println!("VPS");
 			let id = s.bits(4) as usize;
 			assert!(id == 0);
 			assert!(s.bits(2) == 3);
@@ -409,7 +409,7 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 				}
 				sets.into_boxed_slice()
 			};
-			println!("SPS {id} {short_term_reference_picture_sets:?}");
+			//println!("SPS {id} {short_term_reference_picture_sets:?}");
 			let long_term_reference_picture_set = s.bit().then(|| (0..s.ue()).map(|_| LongTermReferencePicture{poc: s.bits(log2_max_poc_lsb) as u8, used: s.bit()}).collect());
 			let temporal_motion_vector_predictor = s.bit();
 			let strong_intra_smoothing = s.bit();
@@ -469,7 +469,7 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 		},
 		NAL::PPS => {
 			let id = s.ue() as usize;
-			println!("def PPS {id}");
+			//println!("def PPS {id}");
 			pps[id] = Some(PPS{
 				sps: s.ue() as usize,
 				dependent_slice_segments: s.bit(),
@@ -518,10 +518,10 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 			});
 		}
 		NAL::IDR_W_RADL|NAL::IDR_N_LP|NAL::TRAIL_R|NAL::TRAIL_N => {
-			println!("{unit:?}");
+			//println!("{unit:?}");
 			let first_slice = s.bit();
 			if Intra_Random_Access_Picture(unit) { let _no_output_of_prior_pics = s.bit(); }
-			let pps = {let id = s.ue() as usize; println!("use PPS {id}"); pps[id].as_ref().unwrap_or_else(|| panic!("{id}"))};
+			let pps = {let id = s.ue() as usize; /*println!("use PPS {id}");*/ pps[id].as_ref().unwrap_or_else(|| panic!("{id}"))};
 			let ref sps = sps[pps.sps].as_ref().unwrap_or_else(|| panic!("{}", pps.sps));
 			let (dependent_slice_segment, slice_segment_address) = if !first_slice {
 				let dependent_slice_segment = pps.dependent_slice_segments && s.bit();
@@ -613,7 +613,7 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 				if first_slice { picture(sequence_context.as_mut().unwrap(), pps, sps, unit, sh.as_ref().unwrap().reference.as_ref()) }
 			} // !dependent_slice_segment
 			let slice_data_byte_offset = (s.bits_offset() + 1 + 7) / 8; // Add 1 to the bits count here to account for the byte_alignment bit, which always is at least one bit and not accounted for otherwise
-			slice(sequence_context.as_ref().unwrap(), sh.as_ref().unwrap(), &data, slice_data_byte_offset, (dependent_slice_segment, slice_segment_address));
+			slice(sequence_context.as_mut().unwrap(), sh.as_ref().unwrap(), &data, slice_data_byte_offset, (dependent_slice_segment, slice_segment_address));
 		}
 	}}};
 
