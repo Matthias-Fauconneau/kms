@@ -4,8 +4,6 @@ fn from_iter_or<T: Copy, const N: usize>(iter: impl IntoIterator<Item=T>, v: T) 
 fn from_iter<T: Default, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] { from_iter_or_else(iter, || Default::default()) }
 fn array<T: Default, const N: usize>(len: usize, mut f: impl FnMut()->T) -> [T; N] { from_iter((0..len).map(|_| f())) }
 
-fn bytes_of<T>(t: &T) -> &[u8] { unsafe{std::slice::from_raw_parts(t as *const _ as *const u8, std::mem::size_of::<T>())} }
-
 mod hevc;
 
 mod va {
@@ -14,8 +12,8 @@ mod va {
 }
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let a = std::str::from_utf8(&std::fs::read("0")?)?.trim().split(' ').map(|x| u8::from_str_radix(x, 16).expect(x)).collect::<Box<_>>();
-    println!("{:?}", unsafe{&*(a.as_ptr() as *const va::VAPictureParameterBufferHEVC)});
+    let trace = std::str::from_utf8(&std::fs::read("0")?)?.trim().split(' ').map(|x| u8::from_str_radix(x, 16).expect(x)).collect::<Box<_>>();
+    //println!("{:?}", unsafe{&*(trace.as_ptr() as *const va::VAPictureParameterBufferHEVC)});
 
     let path = std::env::args().skip(1).next().unwrap_or(std::env::var("HOME")?+"/input.mkv");
     let input = unsafe{memmap::Mmap::map(&std::fs::File::open(path)?)}?;
@@ -95,35 +93,9 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ).unwrap_or(0),
                     va_reserved:[0;_]
                 })
-            }), va::VAPictureHEVC{picture_id:0,pic_order_cnt:0,flags:0,va_reserved:[0;_]}),
+            }), va::VAPictureHEVC{picture_id:0xFFFFFFFF,pic_order_cnt:0,flags:va::VA_PICTURE_HEVC_INVALID,va_reserved:[0;_]}),
             pic_width_in_luma_samples: sps.width,
             pic_height_in_luma_samples: sps.height,
-            log2_min_luma_coding_block_size_minus3: sps.log2_min_coding_block_size - 3,
-            sps_max_dec_pic_buffering_minus1: sps.layer_ordering.last().unwrap().max_dec_pic_buffering - 1,
-            log2_diff_max_min_luma_coding_block_size: sps.log2_diff_max_min_coding_block_size,
-            log2_min_transform_block_size_minus2: sps.log2_min_transform_block_size - 2,
-            log2_diff_max_min_transform_block_size: sps.log2_diff_max_min_transform_block_size,
-            max_transform_hierarchy_depth_inter: sps.max_transform_hierarchy_depth_inter,
-            max_transform_hierarchy_depth_intra: sps.max_transform_hierarchy_depth_intra,
-            num_short_term_ref_pic_sets: sps.short_term_reference_picture_sets.len() as u8,
-            num_long_term_ref_pic_sps: sps.long_term_reference_picture_set.as_ref().map(|s| s.len()).unwrap_or(0) as u8,
-            num_ref_idx_l0_default_active_minus1: pps.num_ref_idx_default_active[0] - 1,
-            num_ref_idx_l1_default_active_minus1: pps.num_ref_idx_default_active[1] - 1,
-            init_qp_minus26: pps.init_qp_minus26,
-            pps_cb_qp_offset: pps.cb_qp_offset,
-            pps_cr_qp_offset: pps.cr_qp_offset,
-            pcm_sample_bit_depth_luma_minus1: sps.pulse_code_modulation.as_ref().map(|p| p.bit_depth - 1).unwrap_or(0),
-            pcm_sample_bit_depth_chroma_minus1: sps.pulse_code_modulation.as_ref().map(|p| p.bit_depth_chroma - 1).unwrap_or(0),
-            log2_min_pcm_luma_coding_block_size_minus3: sps.pulse_code_modulation.as_ref().map(|p| p.log2_min_coding_block_size - 3).unwrap_or(0),
-            log2_diff_max_min_pcm_luma_coding_block_size: sps.pulse_code_modulation.as_ref().map(|p| p.log2_diff_max_min_coding_block_size).unwrap_or(0),
-            diff_cu_qp_delta_depth: pps.diff_cu_qp_delta_depth.unwrap_or(0),
-            pps_beta_offset_div2: pps.deblocking_filter.as_ref().map(|f| f.1.as_ref().map(|f| f.beta_offset / 2)).flatten().unwrap_or(0),
-            pps_tc_offset_div2: pps.deblocking_filter.as_ref().map(|f| f.1.as_ref().map(|f| f.tc_offset / 2)).flatten().unwrap_or(0),
-            log2_parallel_merge_level_minus2: pps.log2_parallel_merge_level - 2,
-            bit_depth_luma_minus8: sps.bit_depth - 8,
-            bit_depth_chroma_minus8: sps.bit_depth - 8,
-            log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_poc_lsb - 4,
-            num_extra_slice_header_bits: pps.num_extra_slice_header_bits,
             pic_fields: va::_VAPictureParameterBufferHEVC__bindgen_ty_1{bits: va::_VAPictureParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1{_bitfield_align_1: [], _bitfield_1:
                 va::_VAPictureParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1::new_bitfield_1(
                     sps.chroma_format_idc as _,
@@ -142,13 +114,39 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pps.tiles.1.is_some() as _,
                     pps.tiles.0/*entropy_coding_sync*/ as _,
                     pps.loop_filter_across_slices as _,
-                    pps.tiles.1.as_ref().map(|t| t.loop_filter_across_tiles).unwrap_or(false) as _,
+                    pps.tiles.1.as_ref().map(|t| t.loop_filter_across_tiles).unwrap_or(/*false*/true) as _,
                     sps.pulse_code_modulation.as_ref().map(|pcm| pcm.loop_filter_disable).unwrap_or(false) as _,
                     false as _, //NoPicReordering
                     false as _, //NoBiPred
                     0, //Reserved
                 )
             }},
+            log2_min_luma_coding_block_size_minus3: sps.log2_min_coding_block_size - 3,
+            sps_max_dec_pic_buffering_minus1: sps.layer_ordering.last().unwrap().max_dec_pic_buffering - 1,
+            log2_diff_max_min_luma_coding_block_size: sps.log2_diff_max_min_coding_block_size,
+            log2_min_transform_block_size_minus2: sps.log2_min_transform_block_size - 2,
+            log2_diff_max_min_transform_block_size: sps.log2_diff_max_min_transform_block_size,
+            max_transform_hierarchy_depth_inter: sps.max_transform_hierarchy_depth_inter,
+            max_transform_hierarchy_depth_intra: sps.max_transform_hierarchy_depth_intra,
+            num_short_term_ref_pic_sets: sps.short_term_reference_picture_sets.len() as u8,
+            num_long_term_ref_pic_sps: sps.long_term_reference_picture_set.as_ref().map(|s| s.len()).unwrap_or(0) as u8,
+            num_ref_idx_l0_default_active_minus1: pps.num_ref_idx_default_active[0] - 1,
+            num_ref_idx_l1_default_active_minus1: pps.num_ref_idx_default_active[1] - 1,
+            init_qp_minus26: pps.init_qp_minus26,
+            pcm_sample_bit_depth_luma_minus1: sps.pulse_code_modulation.as_ref().map(|p| p.bit_depth - 1).unwrap_or(/*0*/0xFF),
+            pcm_sample_bit_depth_chroma_minus1: sps.pulse_code_modulation.as_ref().map(|p| p.bit_depth_chroma - 1).unwrap_or(/*0*/0xFF),
+            log2_min_pcm_luma_coding_block_size_minus3: sps.pulse_code_modulation.as_ref().map(|p| p.log2_min_coding_block_size - 3).unwrap_or(/*0*/0xFD),
+            log2_diff_max_min_pcm_luma_coding_block_size: sps.pulse_code_modulation.as_ref().map(|p| p.log2_diff_max_min_coding_block_size).unwrap_or(0),
+            diff_cu_qp_delta_depth: pps.diff_cu_qp_delta_depth.unwrap_or(0),
+            pps_cb_qp_offset: pps.cb_qp_offset,
+            pps_cr_qp_offset: pps.cr_qp_offset,
+            pps_beta_offset_div2: pps.deblocking_filter.as_ref().map(|f| f.1.as_ref().map(|f| f.beta_offset / 2)).flatten().unwrap_or(0),
+            pps_tc_offset_div2: pps.deblocking_filter.as_ref().map(|f| f.1.as_ref().map(|f| f.tc_offset / 2)).flatten().unwrap_or(0),
+            log2_parallel_merge_level_minus2: pps.log2_parallel_merge_level - 2,
+            bit_depth_luma_minus8: sps.bit_depth - 8,
+            bit_depth_chroma_minus8: sps.bit_depth - 8,
+            log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_poc_lsb - 4,
+            num_extra_slice_header_bits: pps.num_extra_slice_header_bits,
             slice_parsing_fields: va::_VAPictureParameterBufferHEVC__bindgen_ty_2{bits: va::_VAPictureParameterBufferHEVC__bindgen_ty_2__bindgen_ty_1{_bitfield_align_1: [], _bitfield_1:
                 va::_VAPictureParameterBufferHEVC__bindgen_ty_2__bindgen_ty_1::new_bitfield_1(
                     pps.lists_modification as _,
@@ -175,7 +173,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             st_rps_bits: reference.map(|r| r.short_term_picture_set_encoded_bits_len_skip).flatten().unwrap_or(0),
             va_reserved: [0; _]
         };
-        println!("vaCreateBuffer {} {:x?}", va::VABufferType_VAPictureParameterBufferType, bytes_of(&data).iter().format(" "));
+        println!("vaCreateBuffer {}\n{:?}", va::VABufferType_VAPictureParameterBufferType, data);
         println!("vaRenderPicture");
         unimplemented!();/*if let Some(scaling_list) = pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()) {
 
@@ -262,7 +260,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             slice_data_num_emu_prevn_bytes: 0,
             va_reserved: [0; _]
         };
-        println!("vaCreateBuffer {} {}", va::VABufferType_VASliceParameterBufferType, bytes_of(&slice_parameter).iter().format(" "));
+        //println!("vaCreateBuffer {} {:?}", va::VABufferType_VASliceParameterBufferType, slice_parameter);
         check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
         let mut buffer = 0;
         println!("data {}", data.len());

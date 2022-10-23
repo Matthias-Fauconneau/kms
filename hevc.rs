@@ -25,7 +25,7 @@ fn profile_tier_level(s: &mut Reader, max_layers: usize) {
     let _profile_space = s.bits(2);
     let _tier = s.bit();
     #[derive(num_derive::FromPrimitive)] pub enum Profile { Main = 1, Main10 }
-    let profile = Profile::from_u64(s.bits(5)).unwrap();
+    let profile = Profile::from_u32(s.bits(5)).unwrap();
     assert!(matches!(profile, Profile::Main10));
     let _profile_compatibility = s.u32();
     let _progressive_source = s.bit();
@@ -44,13 +44,13 @@ fn profile_tier_level(s: &mut Reader, max_layers: usize) {
         let _one_picture_only = s.bit();
         let _lower_bit_rate = s.bit();
         s.bits(34);*/
-    s.bits(44);
+    s.skip(44);
     let _level_idc = s.u8();
     if max_layers > 1 {
         let layers : [_; 8] = std::array::from_fn(|_| (s.bit(), s.bit()));
         println!("{layers:?}");
         let _layers = layers.map(|(profile, level)| {
-            if profile { s.bits(44); s.bits(43); }
+            if profile { s.skip(44); s.skip(43); }
             if level { s.u8(); }
         });
     }
@@ -127,7 +127,7 @@ fn scaling_list(s: &mut Reader) -> ScalingList {
             for matrix_id in 0..M {
                 matrices[matrix_id] = if !s.bit() { matrices[matrix_id - s.ue() as usize] } else {
                     let dc = 8 + if DC { s.se() } else { 0 } as u8;
-                    let diagonally_ordered_coefficients = std::iter::successors(Some(dc), |&last| Some((last as i64 + 0x100 + s.se()) as u8)).take(N*N).collect::<Box<_>>();
+                    let diagonally_ordered_coefficients = std::iter::successors(Some(dc), |&last| Some((last as i32 + 0x100 + s.se()) as u8)).take(N*N).collect::<Box<_>>();
                     let diagonal_scan = (0..N).map(|i| (0..=i).map(move |j| (i-j,j))).flatten() .chain( (1..N).map(|j| (0..N-j).rev().map(move |i| (i-j,j))).flatten() ).map(|(i,j)| i*N+j);
                     let mut matrix = [0; {N*N}]; for (diagonal, raster) in diagonal_scan.enumerate() { matrix[raster] = diagonally_ordered_coefficients[diagonal]; }
                     (dc, matrix)
@@ -293,7 +293,7 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 	let ref mut s = Reader::new(&data);
 	assert!(s.bit() == false); //forbidden_zero_bit
 	//let _ref_idc = s.bits(2);
-	let unit = NAL::from_u64(s.bits(/*5*/6)).unwrap();
+	let unit = NAL::from_u32(s.bits(/*5*/6)).unwrap();
 	let _temporal_id = if !false/*matches!(unit_type, EOS_NUT|EOB_NUT)*/ {
 		let _layer_id = s.bits(6);
 		s.bits(3) - 1
@@ -469,6 +469,7 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 		},
 		NAL::PPS => {
 			let id = s.ue() as usize;
+			println!("def PPS {id}");
 			pps[id] = Some(PPS{
 				sps: s.ue() as usize,
 				dependent_slice_segments: s.bit(),
@@ -520,15 +521,15 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 			println!("{unit:?}");
 			let first_slice = s.bit();
 			if Intra_Random_Access_Picture(unit) { let _no_output_of_prior_pics = s.bit(); }
-			let pps = {let index = s.ue() as usize; pps[index].as_ref().unwrap_or_else(|| panic!("{index}"))};
+			let pps = {let id = s.ue() as usize; println!("use PPS {id}"); pps[id].as_ref().unwrap_or_else(|| panic!("{id}"))};
 			let ref sps = sps[pps.sps].as_ref().unwrap_or_else(|| panic!("{}", pps.sps));
 			let (dependent_slice_segment, slice_segment_address) = if !first_slice {
 				let dependent_slice_segment = pps.dependent_slice_segments && s.bit();
 				(dependent_slice_segment, Some(s.bits(ceil_log2((sps.width as usize * sps.height as usize) as usize)) as usize))
 			} else { (false, None) };
 			if !dependent_slice_segment {
-				s.advance(pps.num_extra_slice_header_bits);
-				let slice_type = SliceType::from_u64(s.ue()).unwrap();
+				s.skip(pps.num_extra_slice_header_bits);
+				let slice_type = SliceType::from_u32(s.ue()).unwrap();
 				let output = pps.output && s.bit();
 				let color_plane_id = if sps.separate_color_plane { s.bits(2) } else { 0 } as u8;
 				let reference = (!Instantaneous_Decoder_Refresh(unit)).then(|| {
@@ -588,7 +589,7 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 						}),
 						prediction_weights: ((matches!(slice_type, SliceType::P) && pps.weighted_prediction) || (b && pps.weighted_biprediction)).then(|| {
 							let log2_denom_weight_luma = s.ue() as u8;
-							let log2_denom_weight_chroma = chroma.then(|| (log2_denom_weight_luma as i64 + s.se()) as u8);
+							let log2_denom_weight_chroma = chroma.then(|| (log2_denom_weight_luma as i32 + s.se()) as u8);
 							let ref pb = active_references.map(|active_references| {
 								array(active_references as usize, || s.bit()).zip(chroma.then(|| array(active_references as usize, || s.bit())).map(|a| a.map(Some)).unwrap_or_default()).map(|(l,c)| LumaChroma{
 									luma: l.then(|| WeightOffset{weight: s.se() as i8, offset: s.se() as i8}).unwrap_or_default(),

@@ -23,9 +23,10 @@ impl<'t> Reader<'t> {
         self.ptr = self.ptr.sub((self.count as usize >> 3) & 7);
         self.count |= 56;
     }
-    fn peek(&self, count: u8) -> u64 { unsafe { self.word.unchecked_shr(64 - count as u64) } }
-    #[track_caller] pub fn advance(&mut self, count: u8) { self.word <<= count; assert!(count <= self.count, "{count} {}", self.count); self.count -= count; }
-    #[track_caller] pub fn bits(&mut self, count: u8) -> u64 {
+    fn peek(&self, count: u8) -> u32 { unsafe { self.word.unchecked_shr(64 - count as u64) as u32 } }
+    #[track_caller] fn advance(&mut self, count: u8) { self.word <<= count; assert!(count <= self.count, "{count} {}", self.count); self.count -= count; }
+    #[track_caller] pub fn skip(&mut self, count: u8) { if count > self.count { unsafe { self.refill(); } } self.advance(count) }
+    #[track_caller] pub fn bits(&mut self, count: u8) -> u32 {
         if count > self.count { unsafe { self.refill(); } }
         let result = self.peek(count);
         self.advance(count);
@@ -35,16 +36,17 @@ impl<'t> Reader<'t> {
     pub fn u8(&mut self) -> u8 { self.bits(8) as u8 }
     pub fn u16(&mut self) -> u16 { self.bits(16) as u16 }
     pub fn u32(&mut self) -> u32 { self.bits(32) as u32 }
-    #[track_caller] pub fn ue(&mut self) -> u64 { // Exp-Golomb
+    #[track_caller] pub fn exp_golomb_code(&mut self) -> u32 {
         unsafe { self.refill(); }
         let count = self.word.leading_zeros() as u8;
         self.advance(count);
-        self.bits(1+count) - 1
+        self.bits(1+count)
     }
-    pub fn se(&mut self) -> i64 {
-        let v = self.ue() as i64;
-        let sign = -(v & 1);
-        ((v >> 1) ^ sign) - sign
+    #[track_caller] pub fn ue(&mut self) -> u32 { self.exp_golomb_code() - 1 }
+    pub fn se(&mut self) -> i32 {
+        let sign_magnitude = self.exp_golomb_code();
+        let sign = -((sign_magnitude & 1) as i32);
+        ((sign_magnitude>>1)^sign as u32) as i32 - sign
     }
     pub fn available(&self) -> usize { self.count as usize + (self.end as usize-self.ptr as usize)*8 }
     pub fn bits_offset(&self) -> usize { (self.ptr as usize-self.begin as usize)*8 - self.count as usize }
