@@ -64,12 +64,12 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             *frame_poc = frame_poc.filter(|&frame_poc| reference.map(|r| r.short_term_pictures.iter().any(|p| ((current_poc as i8+p.delta_poc) as u8) == frame_poc) || r.long_term_pictures.iter().any(|p| p.poc == frame_poc)).unwrap_or(false));
         }
         let current = frames.iter_mut().find(|f| f.poc.is_none()).unwrap();
+        println!("vaBeginPicture {}", current.id);
+        check(unsafe{va::vaBeginPicture(va, context, current.id)});
         *current_id = Some(current.id);
         current.poc = Some(current_poc);
 
-        let mut buffer = 0; //VABufferID
-        println!("vaBeginPicture {}", current.id);
-        let data = va::VAPictureParameterBufferHEVC{
+        let picture_parameter_buffer = va::VAPictureParameterBufferHEVC{
             CurrPic: va::VAPictureHEVC {
                 picture_id: current.id,
                 pic_order_cnt: current_poc as i32,
@@ -173,10 +173,14 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             st_rps_bits: reference.map(|r| r.short_term_picture_set_encoded_bits_len_skip).flatten().unwrap_or(0),
             va_reserved: [0; _]
         };
-        println!("vaCreateBuffer {}\n{:?}", va::VABufferType_VAPictureParameterBufferType, data);
+        let mut buffer = 0; //VABufferID
+        println!("vaCreateBuffer {}\n{:?}", va::VABufferType_VAPictureParameterBufferType, &"picture_parameter_buffer");
+        check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VAPictureParameterBufferType, std::mem::size_of::<va::VAPictureParameterBufferHEVC>() as std::ffi::c_uint, 1,
+            &picture_parameter_buffer as *const _ as *mut _, &mut buffer)});
         println!("vaRenderPicture");
-        unimplemented!();/*if let Some(scaling_list) = pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()) {
-
+        check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
+        if let Some(scaling_list) = pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()) {
+            unimplemented!();
             let mut buffer = 0;
             check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VAIQMatrixBufferType, std::mem::size_of::<va::VAIQMatrixBufferHEVC> as u32, 1, &mut va::VAIQMatrixBufferHEVC{
                 ScalingList4x4: scaling_list.x4,
@@ -188,17 +192,11 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 va_reserved: [0; _],
             } as *const _ as *mut _, &mut buffer)});
             check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
-        }*/
+        }
     },
     |Sequence{context,frames,..}, sh, data, slice_data_byte_offset, (dependent_slice_segment, slice_segment_address)| {
-        let context = *context;
-        let prediction_weights = sh.inter.as_ref().map(|s| s.prediction_weights.clone()/*.map(|LumaChroma{luma: l, chroma: c}| LumaChroma{
-            luma: Tables{ log2_denom_weight: l.log2_denom_weight, pb: l.pb.map(|t| WeightOffset{weight: t.map(|w| w.weight - (1<<l.log2_denom_weight)), offset: t.map(|w| w.offset)})) },
-            chroma: c.map(|c| Tables{ log2_denom_weight: c.log2_denom_weight as i8 - l.log2_denom_weight as i8, pb: c.pb.map(|t| t.map(|p| p.map(|w| WeightOffset{weight: w.weight - (1<<c.log2_denom_weight), offset: w.offset})))}),
-        })*/).flatten().unwrap_or_default();
-        let mut buffer = 0;
-        unimplemented!();
-        let slice_parameter = va::VASliceParameterBufferHEVC{
+        let prediction_weights = sh.inter.as_ref().map(|s| s.prediction_weights.clone()).flatten().unwrap_or_default();
+        let slice_parameter_buffer = va::VASliceParameterBufferHEVC{
             slice_data_size: data.len() as u32,
             slice_data_offset: 0,
             slice_data_flag: va::VA_SLICE_DATA_FLAG_ALL,
@@ -260,10 +258,15 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             slice_data_num_emu_prevn_bytes: 0,
             va_reserved: [0; _]
         };
-        //println!("vaCreateBuffer {} {:?}", va::VABufferType_VASliceParameterBufferType, slice_parameter);
+        let context = *context;
+        let mut buffer = 0;
+        println!("vaCreateBuffer {} {:?}", va::VABufferType_VASliceParameterBufferType, &"slice_parameter_buffer");
+        check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VASliceParameterBufferType, std::mem::size_of::<va::VASliceParameterBufferHEVC>() as u32, 1,
+            &slice_parameter_buffer as *const _ as *mut _, &mut buffer)});
+        println!("vaRenderPicture");
         check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
         let mut buffer = 0;
-        println!("data {}", data.len());
+        println!("vaCreateBuffer {} {:?}", va::VABufferType_VASliceDataBufferType, data);
         check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VASliceDataBufferType, data.len() as _, 1, data.as_ptr() as *const std::ffi::c_void as *mut _, &mut buffer)});
         check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});
     },
@@ -273,7 +276,35 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut descriptor = va::VADRMPRIMESurfaceDescriptor::default();
         println!("export {}", current_id.unwrap());
         check(unsafe{va::vaExportSurfaceHandle(va, current_id.unwrap(), va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, va::VA_EXPORT_SURFACE_READ_ONLY | va::VA_EXPORT_SURFACE_SEPARATE_LAYERS, &mut descriptor as *mut _ as *mut _)});
-        //let size = xy{x: descriptor.width, y: descriptor.height};
+        use vector::xy;
+        let size = xy{x: descriptor.width, y: descriptor.height};
+        {
+            let fd = unsafe{std::os::unix::io::FromRawFd::from_raw_fd(descriptor.objects[0].fd)};
+            use image::Image;
+            struct Widget (Image<rustix::io::OwnedFd>);
+            impl ui::Widget for Widget { fn paint(&mut self, target: &mut ui::Target, _: ui::size, _: ui::int2) -> ui::Result<()> {
+                let fd = &self.0.data;
+                let map = unsafe{memmap::Mmap::map(fd).unwrap()};
+                const DMA_BUF_BASE: u8 = b'b';
+                const DMA_BUF_IOCTL_SYNC: u8 = 0;
+                const DMA_BUF_SYNC_READ: u64 = 1 << 0;
+                const DMA_BUF_SYNC_END: u64 = 1 << 2;
+                nix::ioctl_write_ptr!(dma_buf_ioctl_sync, DMA_BUF_BASE, DMA_BUF_IOCTL_SYNC, u64);
+                let fd = fd.as_raw_fd();
+                println!("sync");
+                panic!();
+                unsafe{dma_buf_ioctl_sync(fd, &DMA_BUF_SYNC_READ as *const _)}.unwrap();
+                println!("OK");
+                let frame = Image::<&[u16]>::cast_slice(&map[0..self.0.size.y as usize*self.0.size.x as usize*std::mem::size_of::<u16>()], self.0.size);
+                use std::cmp::min;
+                dbg!(self.0.size);
+                for y in 0..min(frame.size.y, target.size.y) { for x in 0..min(frame.size.x, target.size.x) { target[xy{x,y}] = (((frame[xy{x,y}] as u32+0x80)/0x101) as u8).into(); }}
+                unsafe{dma_buf_ioctl_sync(fd, &(DMA_BUF_SYNC_READ|DMA_BUF_SYNC_END) as *const _)}.unwrap();
+                Ok(())
+            } }
+            ui::run(&mut Widget(Image{data: fd, size, stride: size.x})).unwrap();
+            panic!("OK");
+        }
     });
 
     /*use drm::{Device, control::{self, Device as _, dumbbuffer::DumbBuffer, *}, buffer::{DrmFourcc, Handle, Buffer, PlanarBuffer}};

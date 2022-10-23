@@ -206,7 +206,7 @@ pub struct PPS {
 fn decode_short_term_reference_picture_set(s: &mut Reader, sets: &[Box<[ShortTermReferencePicture]>], slice_header: bool) -> Box<[ShortTermReferencePicture]> {
     if !sets.is_empty() && /*predict*/s.bit() {
         let ref set = &sets[sets.len()-1-if slice_header {s.ue() as usize} else {0}];
-        let delta = if s.bit() { -1 } else { 1 } * (s.ue()+1) as i8;
+        let delta = if s.bit() { -1 } else { 1 } * (s.exp_golomb_code()) as i8;
         let mut parse = |&ShortTermReferencePicture{delta_poc,..}| { let used = s.bit(); if used || s.bit() { Some(ShortTermReferencePicture{delta_poc:delta_poc+delta, used}) } else { None } };
         let mut set = set.iter().filter_map(&mut parse).collect::<Vec<_>>();
         let p = parse(&ShortTermReferencePicture{delta_poc:0,used:false});
@@ -324,7 +324,7 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 					let _active_video_parameter_set_id = s.bits(4);
 					let _self_contained_cvs = s.bit();
 					let _no_parameter_set_update = s.bit();
-					let num_sps_ids = s.ue()+1;
+					let num_sps_ids = s.exp_golomb_code();
 					let active_seq_parameter_set_id = s.ue();
 					println!("active parameter sets: {_active_video_parameter_set_id} {_self_contained_cvs} {_no_parameter_set_update} {num_sps_ids} {active_seq_parameter_set_id}");
 				}
@@ -646,8 +646,8 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 				for data in &mut iterator(data, unit) {
 					parse_nal(&mut sequence_context, data);
 				}
+				end_cluster(sequence_context.as_ref().unwrap());
 			}
-			end_cluster(sequence_context.as_ref().unwrap());
 		},
 		Cues(_) => {},
 		Chapters(_) => {},
