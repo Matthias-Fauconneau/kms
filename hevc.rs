@@ -265,31 +265,46 @@ pub struct SliceHeader {
     pub loop_filter_across_slices: bool,
 }
 
-pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: impl FnMut(&mut S, &PPS, &SPS, NAL, Option<&SHReference>), mut slice: impl FnMut(&mut S, &SliceHeader, &[u8], usize, (bool, Option<usize>)), mut end_cluster: impl FnMut(&S)) {
-	let ref mut parse_nal = {
-    let mut vps : [_; 16] = Default::default();
-	let mut sps : [_; 16] = Default::default();
-    let mut pps/*: [_; 64] = Default::default()*/= (|len|{let mut v = Vec::new(); v.resize_with(len, || None); v})(64);
-    let mut sh = None;
-	move |sequence_context: &mut Option<S>, data: &[u8]| {
-	pub fn clear_start_code_emulation_prevention_3_byte(data: &[u8]) -> Vec<u8> {
-		data.iter()
-			.enumerate()
-			.filter_map(|(index, value)| {
-				if index > 2
-					&& index < data.len() - 2
-					&& data[index - 2] == 0
-					&& data[index - 1] == 0
-					&& data[index] == 3
-				{
-					None
-				} else {
-					Some(*value)
-				}
-			})
-			.collect::<Vec<u8>>()
-	}
-	let data = clear_start_code_emulation_prevention_3_byte(data);
+/*pub struct Slice<'t> {
+	escaped_data: &'t [u8],
+	slice_data_byte_offset: usize,
+	dependent_slice_segment: bool,
+	slice_segment_address: Option<usize>
+}*/
+
+pub struct HEVC {
+	vps : [Option<VPS>; 16],
+	sps : [Option<SPS>; 16],
+	pps: [Option<PPS>; 64],
+	slice_header: Option<SliceHeader>,
+	//deferred_slice: Option<Slice<'t>>,
+}
+
+/*enum Event<'t> {
+	Sequence(&'t SPS),
+	//Picture{pps: &'t PPS, sps: &'t SPS, nal: NAL, reference: Option<&'t SHReference>},
+	Slice{
+		slice_header: &'t Option<SliceHeader>, /*slice: Slice<'t>,*/escaped_data: &'t [u8],
+		slice_data_byte_offset: usize,
+		dependent_slice_segment: bool,
+		slice_segment_address: Option<usize>, last: bool},
+	EndCluster,
+}*/
+
+pub struct Slice<'t> {
+	pub sps: &'t SPS,
+	pub pps: &'t PPS,
+	pub unit: NAL,
+	pub slice_header: &'t SliceHeader,
+	pub escaped_data: &'t [u8],
+	pub slice_data_byte_offset: usize,
+	pub dependent_slice_segment: bool,
+	pub slice_segment_address: Option<usize>,
+}
+
+impl HEVC {
+fn unit<'i: 'o,'o>(&'i mut self, escaped_data: &'i [u8]) -> Option<Slice<'o>> {
+	let data = escaped_data[0..2].iter().copied().chain(escaped_data.array_windows().filter_map(|&[a,b,c]| (!(a == 0 && b== 0 && c == 3)).then(|| c))).collect::<Vec<u8>>();
 	let ref mut s = Reader::new(&data);
 	assert!(s.bit() == false); //forbidden_zero_bit
 	//let _ref_idc = s.bits(2);
@@ -363,7 +378,7 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 				(0..s.ue()).map(|i| { let _hrd_layer_set_index = s.ue(); let common_inf = i>0 && s.bit(); hrd_parameters(s, common_inf, max_layers) }).count();
 			}
 			s.bit(); // vps_extension
-			vps[id] = Some(VPS{});
+			self.vps[id] = Some(VPS{});
 		}
 		NAL::SPS => {
 			let vps = s.bits(4) as usize;
@@ -373,12 +388,13 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 			let _temporal_id_nesting = s.bit();
 			profile_tier_level(s, max_layers);
 			let id = s.ue() as usize;
-			assert!(id < sps.len(), "{id}");
+			assert!(id < self.sps.len(), "{id}");
 			let chroma_format_idc = s.ue() as u8;
 			let separate_color_plane = if chroma_format_idc == 3 { s.bit() } else { false };
 			let chroma_format_idc = if separate_color_plane { 0 } else { chroma_format_idc };
 			let width = s.ue() as u16;
 			let height = s.ue() as u16;
+			assert!(width <= 3840 && height <= 2160);
 			if s.bit() { let (_left, _right, _top, _bottom) = (s.ue(), s.ue(), s.ue(), s.ue()); }
 			let bit_depth = 8 + s.ue() as u8;
 			assert!(bit_depth == 10);
@@ -453,7 +469,7 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 				}
 			}
 			let _sps_extension = s.bit();
-			let s = SPS{separate_color_plane, chroma_format_idc, width, height, bit_depth, log2_max_poc_lsb, layer_ordering,
+			self.sps[id] = Some(SPS{separate_color_plane, chroma_format_idc, width, height, bit_depth, log2_max_poc_lsb, layer_ordering,
 				log2_min_coding_block_size, log2_diff_max_min_coding_block_size,
 				log2_min_transform_block_size, log2_diff_max_min_transform_block_size, max_transform_hierarchy_depth_inter, max_transform_hierarchy_depth_intra,
 				scaling_list,
@@ -462,15 +478,12 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 				pulse_code_modulation,
 				short_term_reference_picture_sets, long_term_reference_picture_set,
 				temporal_motion_vector_predictor,
-				strong_intra_smoothing};
-			*sequence_context = Some(sequence(&s));
-			assert!(s.width <= 3840 && s.height <= 2160);
-			sps[id] = Some(s);
+				strong_intra_smoothing});
 		},
 		NAL::PPS => {
 			let id = s.ue() as usize;
 			//println!("def PPS {id}");
-			pps[id] = Some(PPS{
+			self.pps[id] = Some(PPS{
 				sps: s.ue() as usize,
 				dependent_slice_segments: s.bit(),
 				output: s.bit(),
@@ -521,11 +534,14 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 			//println!("{unit:?}");
 			let first_slice = s.bit();
 			if Intra_Random_Access_Picture(unit) { let _no_output_of_prior_pics = s.bit(); }
-			let pps = {let id = s.ue() as usize; /*println!("use PPS {id}");*/ pps[id].as_ref().unwrap_or_else(|| panic!("{id}"))};
-			let ref sps = sps[pps.sps].as_ref().unwrap_or_else(|| panic!("{}", pps.sps));
+			let pps = {let id = s.ue() as usize; /*println!("use PPS {id}");*/ self.pps[id].as_ref().unwrap_or_else(|| panic!("{id}"))};
+			let ref sps = self.sps[pps.sps].as_ref().unwrap_or_else(|| panic!("{}", pps.sps));
 			let (dependent_slice_segment, slice_segment_address) = if !first_slice {
 				let dependent_slice_segment = pps.dependent_slice_segments && s.bit();
-				(dependent_slice_segment, Some(s.bits(ceil_log2((sps.width as usize * sps.height as usize) as usize)) as usize))
+				let log2_ctb_size = sps.log2_min_coding_block_size + sps.log2_diff_max_min_coding_block_size;
+				let ctb_size = 1<<log2_ctb_size;
+				let [ctb_width, ctb_height] = [sps.width, sps.height].map(|size| (size +(ctb_size-1)) >> log2_ctb_size);
+				(dependent_slice_segment, Some(s.bits(ceil_log2((ctb_width*ctb_height) as usize) as u8) as usize))
 			} else { (false, None) };
 			if !dependent_slice_segment {
 				s.skip(pps.num_extra_slice_header_bits);
@@ -609,20 +625,23 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 				//cu_chroma_qp_offsets: pps.chroma_qp_offset_list && s.bit(),
 				let deblocking_filter = pps.deblocking_filter.as_ref().map(|(r#override, pps)| if *r#override && s.bit() { (!s.bit()).then(|| DeblockingFilter{beta_offset: 2 * s.se() as i8, tc_offset: 2 * s.se() as i8}) } else { pps.clone() }).flatten();
 				let loop_filter_across_slices = if pps.loop_filter_across_slices && (sample_adaptive_offset.luma || sample_adaptive_offset.chroma.unwrap_or(false) || deblocking_filter.is_some()) { s.bit() } else { pps.loop_filter_across_slices };
-				sh = Some(SliceHeader{slice_type, output, color_plane_id, reference, sample_adaptive_offset, inter, qp_delta, qp_offsets,/*cu_chroma_qp_offsets,*/deblocking_filter, loop_filter_across_slices});
-				if first_slice { picture(sequence_context.as_mut().unwrap(), pps, sps, unit, sh.as_ref().unwrap().reference.as_ref()) }
+				self.slice_header = Some(SliceHeader{slice_type, output, color_plane_id, reference, sample_adaptive_offset, inter, qp_delta, qp_offsets, deblocking_filter, loop_filter_across_slices});
 			} // !dependent_slice_segment
 			let slice_data_byte_offset = (s.bits_offset() + 1 + 7) / 8; // Add 1 to the bits count here to account for the byte_alignment bit, which always is at least one bit and not accounted for otherwise
-			slice(sequence_context.as_mut().unwrap(), sh.as_ref().unwrap(), &data, slice_data_byte_offset, (dependent_slice_segment, slice_segment_address));
+			assert!(slice_data_byte_offset <= 8); // Assumes no escape
+			//*if first_slice { picture(context.sequence.as_mut().unwrap(), pps, sps, unit, context.slice_header.as_ref().unwrap().reference.as_ref()) }
+			return Some(Slice{pps, sps, unit, slice_header: self.slice_header.as_ref().unwrap(), escaped_data, slice_data_byte_offset, dependent_slice_segment, slice_segment_address});
 		}
-	}}};
-
-	let mut sequence_context = None;
+	}
+	None
+}
+pub fn parse(input: &[u8], mut dispatch: impl FnMut(Slice, bool)) {
 	let mut demuxer = matroska::demuxer::MkvDemuxer::new();
     let (input, ()) = demuxer.parse_until_tracks(input).unwrap();
     let tracks = demuxer.tracks.unwrap();
     let video = &tracks.tracks[0];
     assert!(video.codec_id == "V_MPEGH/ISO/HEVC");
+	let mut context = Self{vps: Default::default(), sps: Default::default(), pps: [();_].map(|_|None), slice_header: None};
 	{
 	let s = &video.codec_private.as_ref().unwrap()[22..];
 	let (&count, s) = s.split_first().unwrap();
@@ -631,8 +650,8 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 		let (count, s) = {let (v, s) = s.split_at(2); (u16::from_be(unsafe{*(v as *const _ as *const u16)}), s)};
 		let mut s = s; for _ in 0..count { s = {
 			let (length, s) = {let (v, s) = s.split_at(2); (u16::from_be(unsafe{*(v as *const _ as *const u16)}), s)};
-			let (nal, s) = s.split_at(length as usize);
-			parse_nal(&mut sequence_context, nal);
+			let (unit, s) = s.split_at(length as usize);
+			assert!(context.unit(unit).is_none());
 			s
 		}}
 		s
@@ -643,14 +662,21 @@ pub fn parse<S>(input: &[u8], mut sequence: impl FnMut(&SPS)->S, mut picture: im
 		Cluster(cluster) => for data_block in cluster.simple_block {
 			let (data, block) = matroska::elements::simple_block(data_block).unwrap();
 			if block.track_number == video.track_number {
-				for data in &mut iterator(data, unit) {
-					parse_nal(&mut sequence_context, data);
+				let mut deferred_slice = None;
+				for unit in &mut iterator(data, unit) {
+					//if let Some(slice) = context.deferred_slice.take() { dispatch(Unit::Slice{slice_header: context.slice_header.as_ref().unwrap(), slice, last: false}); }
+					if let Some(slice) = deferred_slice.take() { dispatch(slice, false); }
+					deferred_slice = context.unit(unit);
 				}
-				end_cluster(sequence_context.as_ref().unwrap());
+				/*if first_slice { picture(context.sequence.as_mut().unwrap(), pps, sps, unit, context.slice_header.as_ref().unwrap().reference.as_ref()) }
+				if let Some(slice) = context.deferred_slice.take() { dispatch(Unit::Slice{slice_header: context.slice_header.as_ref().unwrap(), slice, last: true}); }
+				dispatch(Unit::EndCluster);*/
+				dispatch(deferred_slice.take().unwrap(), true);
 			}
 		},
 		Cues(_) => {},
 		Chapters(_) => {},
 		_ => panic!("{element:?}")
 	}}
+}
 }
