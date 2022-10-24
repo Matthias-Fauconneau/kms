@@ -1,8 +1,9 @@
-#![allow(incomplete_features)]#![feature(int_log,generic_arg_infer,generic_const_exprs,array_zip,unchecked_math,array_methods,iter_array_chunks,array_windows,array_chunks,new_uninit)]
+#![allow(incomplete_features)]#![feature(int_log,generic_arg_infer,generic_const_exprs,array_zip,unchecked_math,array_methods,iter_array_chunks,array_windows,array_chunks,new_uninit,closure_track_caller)]
 fn from_iter_or_else<T, const N: usize>(iter: impl IntoIterator<Item=T>, f: impl Fn() -> T+Copy) -> [T; N] { let mut iter = iter.into_iter(); [(); N].map(|_| iter.next().unwrap_or_else(f)) }
 fn from_iter_or<T: Copy, const N: usize>(iter: impl IntoIterator<Item=T>, v: T) -> [T; N] { from_iter_or_else(iter, || v) }
-fn from_iter<T: Default, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] { from_iter_or_else(iter, || Default::default()) }
-fn array<T: Default, const N: usize>(len: usize, mut f: impl FnMut()->T) -> [T; N] { from_iter((0..len).map(|_| f())) }
+#[track_caller] fn from_iter<T, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] { from_iter_or_else(iter, #[track_caller] || unreachable!()) }
+fn from_iter_or_default<T: Default, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] { from_iter_or_else(iter, || Default::default()) }
+fn array<T: Default, const N: usize>(len: usize, mut f: impl FnMut()->T) -> [T; N] { from_iter_or_default((0..len).map(|_| f())) }
 
 fn bytes_of<T>(value: &T) -> &[u8] { unsafe{std::slice::from_raw_parts(value as *const _ as *const u8, std::mem::size_of::<T>())} }
 
@@ -16,7 +17,7 @@ mod va {
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().skip(1).next().unwrap_or(std::env::var("HOME")?+"/input.mkv");
 
-    let av = {
+    let av = if true {
         mod av {
             #![allow(dead_code,non_camel_case_types,non_upper_case_globals,improper_ctypes,non_snake_case)]
             include!(concat!(env!("OUT_DIR"), "/av.rs"));
@@ -44,8 +45,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         check(unsafe{avcodec_open2(decoder_context, decoder, std::ptr::null_mut())});
 
         let packet = unsafe{av_packet_alloc()};
-        let mut av = None;
-        while unsafe{av_read_frame(context, packet)} >= 0 {
+        let mut av = Vec::new();
+        while av.len()<136 && unsafe{av_read_frame(context, packet)} >= 0 {
             if video_stream == unsafe{&*packet}.stream_index {
                 check(unsafe{avcodec_send_packet(decoder_context, packet)});
                 assert!(unsafe{&mut *decoder_context}.hwaccel != std::ptr::null());
@@ -53,7 +54,17 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let status = unsafe{avcodec_receive_frame(decoder_context, frame)};
                 if status == -libc::EAGAIN { continue; }
                 check(status);
-                let frame = {
+                #[repr(C)] struct VAAPIDecodeTraceBuffer {
+                    r#type: u32,
+                    len: usize,
+                    data: *const u8,
+                }
+                extern "C" { static mut vaapi_decode_trace_buffers : [VAAPIDecodeTraceBuffer; 64]; }
+                let buffers = unsafe{&vaapi_decode_trace_buffers}.into_iter().map(|b| (!b.data.is_null()).then(||(b.r#type, unsafe{std::slice::from_raw_parts(b.data, b.len)}))).fuse().flatten().collect::<Box<_>>();
+                println!("buffers {}", buffers.len());
+                unsafe{vaapi_decode_trace_buffers = [(); _].map(|_|VAAPIDecodeTraceBuffer{r#type: 0, len: 0, data: std::ptr::null()})}; // Leaks
+
+                /*let frame = {
                     let sw = unsafe{&mut *av_frame_alloc()};
                     sw.format = AVPixelFormat_AV_PIX_FMT_P010LE;
                     check(unsafe{av_hwframe_transfer_data(sw, frame, 0)});
@@ -61,14 +72,14 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sw
                 };
                 let mut buffer = unsafe{Box::new_uninit_slice(av_image_get_buffer_size(frame.format, frame.width, frame.height, 1) as _).assume_init()};
-                assert_eq!(unsafe{av_image_copy_to_buffer(buffer.as_mut_ptr(), buffer.len() as _, frame.data.as_ptr() as *const *const _, frame.linesize.as_ptr(), frame.format, frame.width, frame.height, 1)}, buffer.len() as i32);
-                av = Some(buffer);
-                break;
+                assert_eq!(unsafe{av_image_copy_to_buffer(buffer.as_mut_ptr(), buffer.len() as _, frame.data.as_ptr() as *const *const _, frame.linesize.as_ptr(), frame.format, frame.width, frame.height, 1)}, buffer.len() as i32);*/
+                av.append(&mut buffers.into_vec());
             }
             unsafe{av_packet_unref(packet)};
         }
         av
-    };
+    } else {Vec::new()};
+    let mut av = std::collections::VecDeque::from(av);
 
     let input = unsafe{memmap::Mmap::map(&std::fs::File::open(&path)?)}?;
 
@@ -91,7 +102,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[derive(Default)] struct Frame {
         id: va::VASurfaceID,
-        poc: Option<u8>,
+        poc: Option<u32>,
     }
     struct Context {
         frames: [Frame; 20],
@@ -100,17 +111,16 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut context = None;
     let mut buffers = Vec::new();
-    let mut trace_buffers = Vec::new();//: Vec<(u32, Box<[u8]>)>,
+    let mut buffer_count = 0;
     use hevc::*;
     HEVC::parse(&*input, |Slice{pps, sps, unit, slice_header, escaped_data,slice_data_byte_offset,dependent_slice_segment,slice_segment_address}, last_slice_of_picture: bool| {
         use itertools::Itertools;
         let context = context.get_or_insert_with(|| {
             let mut ids = [0; _];
-            println!("vaCreateSurfaces {}", ids.len());
             check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_YUV420_10, sps.width as _, sps.height as _, ids.as_mut_ptr(), ids.len() as _, std::ptr::null_mut(), 0)});
+            ids.reverse(); // to match AV
             Context{context: {
                 let mut context = 0;
-                println!("vaCreateContext {} {} {} {}", sps.width, sps.height, "VA_PROGRESSIVE", 16);
                 check(unsafe{va::vaCreateContext(va, config, sps.width as _, sps.height as _, va::VA_PROGRESSIVE as _, ids.as_ptr() as *mut _, ids.len() as _, &mut context)});
                 context
             }, frames: ids.map(|id| Frame{id, poc: None}), current_id: None}
@@ -118,20 +128,43 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         let frames = &mut context.frames;
         let reference = slice_header.reference.as_ref();
 
-        let mut render = {let context = context.context; let buffers = &mut buffers; let trace_buffers = &mut trace_buffers; move |r#type, data:&[u8]| {
+        let mut render = {let context = context.context; let buffers = &mut buffers; let av = &mut av; let buffer_count = &mut buffer_count; move |r#type, data:&[u8]| {
+            *buffer_count += 1;
+            if let Some(av) = av.pop_front() {
+                assert_eq!(r#type, av.0);
+                if data != av.1 {
+                    println!("{}", r#type);
+                    for chunk in data.iter().zip(av.1).array_chunks::<64>() {
+                        let (a,b) = chunk.iter().map(|(a,b)| { let f = if a==b { "\x1b[0m" } else { "\x1b[31m" }.to_string(); (f.clone()+&format!("{a:02x}"), f+&format!("{b:02x}")) }).unzip::<_,_,Vec<_>,Vec<_>>();
+                        println!("+ {}", &a.array_chunks::<16>().map(|x| x.concat()+" ").format(""));
+                        println!("- {}", &b.array_chunks::<16>().map(|x| x.concat()+" ").format(""));
+                    }
+                    panic!();/*if ![0/*,1,3,5,7,9,11,13,15*/].contains(&i) {
+                        if r#type == 4 {
+                            let a = unsafe{&*(a.as_ptr() as *const va::VASliceParameterBufferHEVC)};
+                            let b = unsafe{&*(b.as_ptr() as *const va::VASliceParameterBufferHEVC)};
+                            if bytes_of(a) != bytes_of(b) {
+                                println!("{:0b}", unsafe{a.LongSliceFlags.value});
+                                println!("{:0b}", unsafe{b.LongSliceFlags.value});
+                            }
+                        }
+                        panic!();
+                    }*/
+                }
+            }
             let mut buffer = 0;
             check(unsafe{va::vaCreateBuffer(va, context, r#type, data.len() as _, 1, data.as_ptr() as *const _ as *mut _, &mut buffer)});
             buffers.push(buffer);
-            trace_buffers.push((r#type, data.to_owned().into_boxed_slice()));
+            //trace_buffers.push((r#type, data.to_owned().into_boxed_slice()));
         }};
 
         let current_id = *context.current_id.get_or_insert_with(|| {
             let current_poc = reference.map(|r| r.poc).unwrap_or(0);
-            //println!("POC {}", current_poc);
-            //println!("DPB [{}]", frames.iter().filter_map(|f| f.poc).format(" "));
-            reference.map(|r| println!("refs [{}]", r.short_term_pictures.iter().map(|p| (current_poc as i8+p.delta_poc) as u8).chain(r.long_term_pictures.iter().map(|p| p.poc)).format("")));
+            println!("POC {}", current_poc);
+            println!("DPB [{}]", frames.iter().filter_map(|f| f.poc).format(" "));
+            reference.map(|r| println!("refs [{};{}]", r.short_term_pictures.iter().map(|p| (current_poc as i32+p.delta_poc as i32) as u32).format(" "),r.long_term_pictures.iter().map(|p| p.poc).format(" ")));
             for Frame{poc: frame_poc,..} in frames.iter_mut() {
-                *frame_poc = frame_poc.filter(|&frame_poc| reference.map(|r| r.short_term_pictures.iter().any(|p| ((current_poc as i8+p.delta_poc) as u8) == frame_poc) || r.long_term_pictures.iter().any(|p| p.poc == frame_poc)).unwrap_or(false));
+                *frame_poc = frame_poc.filter(|&frame_poc| reference.map(|r| r.short_term_pictures.iter().any(|p| ((current_poc as i32+p.delta_poc as i32) as u32) == frame_poc) || r.long_term_pictures.iter().any(|p| p.poc == frame_poc)).unwrap_or(false));
             }
 
             #[allow(non_snake_case)] let ReferenceFrames = from_iter_or(frames.iter().filter_map(|frame| {
@@ -140,7 +173,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                     picture_id: frame.id,
                     pic_order_cnt: frame_poc as i32,
                     flags: reference.map(|r|
-                        r.short_term_pictures.iter().filter_map(|&hevc::ShortTermReferencePicture{delta_poc, used}| used.then(|| (current_poc as i8+delta_poc) as u8)).find(|&poc| poc == frame_poc).map(|poc|
+                        r.short_term_pictures.iter().filter_map(|&hevc::ShortTermReferencePicture{delta_poc, used}| used.then(|| (current_poc as i32+delta_poc as i32) as u32)).find(|&poc| poc == frame_poc).map(|poc|
                             match poc.cmp(&current_poc) {
                                 std::cmp::Ordering::Less => va::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE,
                                 std::cmp::Ordering::Greater => va::VA_PICTURE_HEVC_RPS_ST_CURR_AFTER,
@@ -153,8 +186,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             }), va::VAPictureHEVC{picture_id:0xFFFFFFFF,pic_order_cnt:0,flags:va::VA_PICTURE_HEVC_INVALID,va_reserved:[0;_]}); // before setting current.poc
 
-            let current = frames./*iter_mut().find(|f| f.poc.is_none())*/last_mut().unwrap();
-            //println!("vaBeginPicture {}", current.id); check(unsafe{va::vaBeginPicture(va, context, current.id)});
+            let current = frames.iter_mut().find(|f| f.poc.is_none()).unwrap();
             assert!(current.poc.is_none());
             current.poc = Some(current_poc); // after setting ReferenceFrames
 
@@ -261,7 +293,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             current.id
         });
-        let context = context.context;
         let prediction_weights = slice_header.inter.as_ref().map(|s| s.prediction_weights.clone()).flatten().unwrap_or_default();
         let sh=&slice_header;
         render(va::VABufferType_VASliceParameterBufferType, bytes_of(&va::VASliceParameterBufferHEVC{
@@ -271,7 +302,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             slice_data_byte_offset: slice_data_byte_offset as u32,
             slice_segment_address: slice_segment_address.unwrap_or(0) as u32,
             RefPicList: slice_header.reference.as_ref().map(|r| {
-                fn index(frames: &[Frame], ref_poc: u8) -> u8 { frames.iter().filter_map(|frame| frame.poc).position(|poc| poc == ref_poc).unwrap_or_else(|| panic!("Missing {ref_poc}")) as u8 }
+                fn index(frames: &[Frame], ref_poc: u32) -> usize { frames.iter().filter_map(|frame| frame.poc).position(|poc| poc == ref_poc).unwrap() }
                 pub fn list<T>(iter: impl std::iter::IntoIterator<Item=T>) -> Box<[T]> { iter.into_iter().collect() }
                 pub fn sort_by<T>(mut s: Box<[T]>, f: impl Fn(&T,&T)->std::cmp::Ordering) -> Box<[T]> { s.sort_by(f); s }
                 pub fn map<T,U>(iter: impl std::iter::IntoIterator<Item=T>, f: impl Fn(T)->U) -> Box<[U]> { list(iter.into_iter().map(f)) }
@@ -280,14 +311,20 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                     map(&*sort_by(
                         list(r.short_term_pictures.into_iter().filter_map(|&hevc::ShortTermReferencePicture{delta_poc, used}|(used && f(delta_poc.cmp(&0)) == std::cmp::Ordering::Greater).then(|| delta_poc))),
                         |a,b| f(a.cmp(b))
-                    ), |delta_poc| index(frames, (current_poc as i8+delta_poc) as u8))
+                    ), |delta_poc| index(frames, (current_poc as i32+*delta_poc as i32) as u32) as u8)
                 }
-                let stps_after = stps(frames, r, |o| o);
-                let stps_before = stps(frames, r, |o| o.reverse());
-                let ltps = map(sort_by(list(r.long_term_pictures.into_iter().filter_map(|&hevc::LongTermReferencePicture{poc, used}| used.then(|| poc))), Ord::cmp).into_iter(), |&poc| index(frames, poc));
-                [ from_iter([&*stps_before, &*stps_after, &*ltps].into_iter().flatten().copied()), from_iter([&*stps_after, &*stps_before, &*ltps].into_iter().flatten().copied())]
+                let ref st_after = stps(frames, r, |o| o);
+                let ref st_before = stps(frames, r, |o| o.reverse());
+                let ref lt = map(sort_by(list(r.long_term_pictures.into_iter().filter_map(|&hevc::LongTermReferencePicture{poc, used}| used.then(|| poc))), Ord::cmp).into_iter(), |&poc| index(frames, poc) as u8);
+                let list = |list:[_;3]| list.map(|e:&Box<[_]>| e.into_iter()).into_iter().flatten().copied().collect::<Box<_>>();
+                let rpl = MayB{p: list([st_before, st_after, lt]), b: matches!(sh.slice_type, SliceType::B).then(|| list([st_after, st_before, lt]))};
+                let inter = slice_header.inter.as_ref().unwrap();
+                assert!(inter.list_entry_lx.is_none());
+                let rpl = if let Some(list_entry_lx) = slice_header.inter.as_ref().unwrap().list_entry_lx.as_ref() { rpl.zip(list_entry_lx).map(|(rpl, list_entry_lx)| list_entry_lx.as_ref().map(|list| map(list.into_iter(), |i| rpl[*i as usize])).unwrap_or(rpl)) } else { rpl.zip(&inter.active_references).map(|(rpl, active_references)| rpl.into_vec().into_iter().take(*active_references as usize).collect()) };
+                let rpl = rpl.map(|list| from_iter_or(list.into_vec().into_iter(), 0xFF));
+                [rpl.p, rpl.b.unwrap_or([0xFF; _])]
             }).unwrap_or([[0xFF; _]; _]),
-            padding: [0; 2],
+            padding0: [0; 2],
             LongSliceFlags: va::_VASliceParameterBufferHEVC__bindgen_ty_1{fields: va::_VASliceParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1{_bitfield_align_1: [], _bitfield_1: va::_VASliceParameterBufferHEVC__bindgen_ty_1__bindgen_ty_1::new_bitfield_1(
                 last_slice_of_picture as _,
                 dependent_slice_segment as _,
@@ -322,110 +359,45 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             delta_chroma_weight_l1: prediction_weights.chroma.clone().unwrap_or_default().pb.b.unwrap_or_default().weight,
             ChromaOffsetL1: prediction_weights.chroma.unwrap_or_default().pb.b.unwrap_or_default().offset,
             five_minus_max_num_merge_cand: sh.inter.as_ref().map(|s| 5 - s.max_num_merge_cand).unwrap_or(0),
+            padding1: 0,
             num_entry_point_offsets: 0,
             entry_offset_to_subset_array: 0,
             slice_data_num_emu_prevn_bytes: 0,
+            padding2: 0,
             va_reserved: [0; _],
-            //..Default::default() // Zero initialize padding holes
+            ..Default::default() // Helps zero initialize padding holes (but unreliable)
         }));
         render(va::VABufferType_VASliceDataBufferType, escaped_data);
         if last_slice_of_picture {
-            println!("vaBeginPicture {}", current_id);
-            check(unsafe{va::vaBeginPicture(va, context, current_id)});
-            println!("{:?}", buffers);
-            check(unsafe{va::vaRenderPicture(va, context, buffers.as_ptr() as *const _ as *mut _, buffers.len() as _)});
-            println!("vaEndPicture");
-            check(unsafe{va::vaEndPicture(va, context)});
-            #[repr(C)] struct VAAPIDecodeTraceBuffer {
-                r#type: u32,
-                len: usize,
-                data: *const u8,
-            }
-            extern "C" { static vaapi_decode_trace_buffers : [VAAPIDecodeTraceBuffer; 17]; }
-            for (i, (a, b)) in trace_buffers.iter().zip(unsafe{&vaapi_decode_trace_buffers}).enumerate() {
-                let r#type = a.0;
-                assert_eq!(r#type, b.r#type);
-                let a = &*a.1;
-                let b = unsafe{std::slice::from_raw_parts(b.data, b.len)};
-                if a != b {
-                    println!("#{i} {}", r#type);
-                    for chunk in a.iter().zip(b).array_chunks::<64>() {
-                        let (a,b) = chunk.iter().map(|(a,b)| { let f = if a==b { "\x1b[0m" } else { "\x1b[31m" }.to_string(); (f.clone()+&format!("{a:02x}"), f+&format!("{b:02x}")) }).unzip::<_,_,Vec<_>,Vec<_>>();
-                        println!("+ {}", &a.array_chunks::<16>().map(|x| x.concat()+" ").format(""));
-                        println!("- {}", &b.array_chunks::<16>().map(|x| x.concat()+" ").format(""));
-                    }
-                    if ![0/*,1,3,5,7,9,11,13,15*/].contains(&i) {
-                        if r#type == 4 {
-                            let a = unsafe{&*(a.as_ptr() as *const va::VASliceParameterBufferHEVC)};
-                            let b = unsafe{&*(b.as_ptr() as *const va::VASliceParameterBufferHEVC)};
-                            if bytes_of(a) != bytes_of(b) {
-                                println!("{:0b}", unsafe{a.LongSliceFlags.value});
-                                println!("{:0b}", unsafe{b.LongSliceFlags.value});
-                            }
-                        }
-                        panic!();
-                    }
-                }
+            {
+                let context = context.context;
+                check(unsafe{va::vaBeginPicture(va, context, current_id)});
+                check(unsafe{va::vaRenderPicture(va, context, buffers.as_ptr() as *const _ as *mut _, buffers.len() as _)}); buffers.clear(); println!("buffer_count {buffer_count}");
+                check(unsafe{va::vaEndPicture(va, context)});
             }
 
-            dbg!("sync");
-            check(unsafe{va::vaSyncSurface(va, current_id)});
-            dbg!("OK");
-
-            //let mut formats = unsafe{Box::new_uninit_slice(va::vaMaxNumImageFormats(va) as usize).assume_init()};
-            //check(unsafe{va::vaQueryImageFormats(va, formats.as_mut_ptr(), &formats.len() as *const _ as *mut _)});
-            //let format = formats.iter().find(|f| f.fourcc == va::VA_FOURCC_P010).unwrap();
+            /*check(unsafe{va::vaSyncSurface(va, current_id)});
             let ref format = va::VAImageFormat{fourcc: va::VA_FOURCC_P010, byte_order: va::VA_LSB_FIRST, bits_per_pixel: 24, depth: 0, red_mask: 0, green_mask: 0, blue_mask: 0, alpha_mask: 0, va_reserved: [0; _]};
             let mut image = va::VAImage{image_id: va::VA_INVALID_ID, ..Default::default()};
-            use vector::xy;
-            let size = dbg!(xy{x: sps.width as usize, y: sps.height as usize});
-            dbg!("create");
-            check(unsafe{va::vaCreateImage(va, dbg!(format) as *const _ as *mut _, sps.width as _, sps.height as _, &mut image)});
-            dbg!("OK");
-            check(unsafe{va::vaGetImage(va, current_id, 0, 0, sps.width as _, sps.height as _, image.image_id)});
+            let size = xy{x: sps.width as u32, y: sps.height as u32};
+            check(unsafe{va::vaCreateImage(va, format as *const _ as *mut _, size.x as _, size.y as _, &mut image)});
+            check(unsafe{va::vaGetImage(va, current_id, 0, 0, size.x, size.y, image.image_id)});
             let mut address : *const u16 = std::ptr::null();
-            check(unsafe{va::vaMapBuffer(va, image.buf, &mut address as *mut * const _ as *mut *mut _)});
+            check(unsafe{va::vaMapBuffer(va, image.buf, &mut address as *mut * const _ as *mut *mut _)});*/
+            //let Y = unsafe{std::slice::from_raw_parts(address, (size.y*size.x) as usize)};
+            /*let b : &[u16] = bytemuck::cast_slice(&av.as_ref().unwrap()[0..((size.x*size.y)*2)as usize]);
+            for y in 0..size.y { for x in 0..size.x { assert_eq!(a[(y*size.x+x) as usize]>>6, b[(y*size.x+x) as usize]>>6, "{:?}", (x, y)); } }*/
 
-            let a = unsafe{std::slice::from_raw_parts(address, size.y*size.x)};
-            let b : &[u16] = bytemuck::cast_slice(&av.as_ref().unwrap()[0..((size.x*size.y)*2)as usize]);
-            for y in 0..size.y { for x in 0..size.x { assert_eq!(a[(y*size.x+x) as usize]>>6, b[(y*size.x+x) as usize]>>6, "{:?}", (x, y)); } }
-            panic!("OK");
-            /*let mut descriptor = va::VADRMPRIMESurfaceDescriptor::default();
-            check(unsafe{va::vaExportSurfaceHandle(va, current_id, va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, va::VA_EXPORT_SURFACE_READ_ONLY | va::VA_EXPORT_SURFACE_SEPARATE_LAYERS, &mut descriptor as *mut _ as *mut _)});
-            panic!("{:?}", drm_fourcc::DrmFormat{code: descriptor.layers[0].drm_format.try_into().unwrap(), modifier: descriptor.objects[0].drm_format_modifier.try_into().unwrap()}); //VA_FOURCC_P010*/
-            /*let ref fd : rustix::io::OwnedFd = unsafe{std::os::unix::io::FromRawFd::from_raw_fd(descriptor.objects[0].fd)};
-            let size = xy{x: descriptor.width, y: descriptor.height};
-            let map = unsafe{memmap::Mmap::map(fd).unwrap()};
-            let a = &map[0..((size.x*size.y)*2)as usize];
-            const DMA_BUF_BASE: u8 = b'b';
-            const DMA_BUF_IOCTL_SYNC: u8 = 0;
-            const DMA_BUF_SYNC_READ: u64 = 1 << 0;
-            const DMA_BUF_SYNC_END: u64 = 1 << 2;
-            nix::ioctl_write_ptr!(dma_buf_ioctl_sync, DMA_BUF_BASE, DMA_BUF_IOCTL_SYNC, u64);
-            let fd = fd.as_raw_fd();
-            unsafe{dma_buf_ioctl_sync(fd, &DMA_BUF_SYNC_READ as *const _)}.unwrap();
-            for y in 0..size.y { for x in 0..size.x { assert_eq!(a[(y*size.x+x) as usize], b[(y*size.x+x) as usize], "{:?}", (x, y)); } }
-            unsafe{dma_buf_ioctl_sync(fd, &(DMA_BUF_SYNC_READ|DMA_BUF_SYNC_END) as *const _)}.unwrap();*/
-
-            /*use image::Image;
-            struct Widget (Image<rustix::io::OwnedFd>);
-            impl ui::Widget for Widget { fn paint(&mut self, target: &mut ui::Target, _: ui::size, _: ui::int2) -> ui::Result<()> {
-                let fd = &self.0.data;
-                let map = unsafe{memmap::Mmap::map(fd).unwrap()};
-                const DMA_BUF_BASE: u8 = b'b';
-                const DMA_BUF_IOCTL_SYNC: u8 = 0;
-                const DMA_BUF_SYNC_READ: u64 = 1 << 0;
-                const DMA_BUF_SYNC_END: u64 = 1 << 2;
-                nix::ioctl_write_ptr!(dma_buf_ioctl_sync, DMA_BUF_BASE, DMA_BUF_IOCTL_SYNC, u64);
-                let fd = fd.as_raw_fd();
-                unsafe{dma_buf_ioctl_sync(fd, &DMA_BUF_SYNC_READ as *const _)}.unwrap();
-                let frame = Image::<&[u16]>::cast_slice(&map[0..self.0.size.y as usize*self.0.size.x as usize*std::mem::size_of::<u16>()], self.0.size);
-                use std::cmp::min;
-                for y in 0..min(frame.size.y, target.size.y) { for x in 0..min(frame.size.x, target.size.x) { target[xy{x,y}] = (((frame[xy{x,y}] as u32+0x80)/0x101) as u8).into(); }}
-                unsafe{dma_buf_ioctl_sync(fd, &(DMA_BUF_SYNC_READ|DMA_BUF_SYNC_END) as *const _)}.unwrap();
+            use image::Image;
+            struct Widget<'t> (Image<&'t [u16]>);
+            impl ui::Widget for Widget<'_> { fn paint(&mut self, target: &mut ui::Target, _: ui::size, _: ui::int2) -> ui::Result<()> {
+                use {vector::xy, std::cmp::min};
+                for y in 0..min(self.0.size.y, target.size.y) { for x in 0..min(self.0.size.x, target.size.x) { target[xy{x,y}] = ((((self.0[xy{x,y}]>>6)+0x80)/0x101) as u8).into(); }}
                 Ok(())
             } }
-            ui::run(&mut Widget(Image{data: fd, size, stride: size.x})).unwrap();*/
+            //ui::run(&mut Widget(Image::new(size, Y))).unwrap();
+            context.current_id = None; // Signals that next slice is a new picture
+            //av.pop_front();
         }
     });
 

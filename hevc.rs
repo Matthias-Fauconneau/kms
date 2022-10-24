@@ -6,13 +6,12 @@ use nom::number::complete::be_u32;
 fn unit(input: &[u8]) -> nom::IResult<&[u8], &[u8]> { let (rest, length) = be_u32(input)?; let length = length as usize; Ok((&rest[length..], &rest[..length])) }
 
 #[allow(non_camel_case_types)] #[repr(u8)] #[derive(Clone,Copy,num_derive::FromPrimitive,Debug)] pub enum NAL {
-    TRAIL_N, TRAIL_R,
-    IDR_W_RADL = 19, // Random Access Decodable Leading
-    IDR_N_LP, // Leading Picture
+    TRAIL_N, TRAIL_R, TSA_N, TSA_R, STSA_N, STSA_R, RADL_N, RADL_R, RASL_N, RASL_R,
+    BLA_W_LP/*Leading Picture*/ = 16, BLA_W_RADL/*Random Access Decodable Leading*/, BLA_N_LP, IDR_W_RADL, IDR_N_LP, CRA_NUT,
     VPS = 32, SPS, PPS, AUD,
-    SEI_PREFIX = 39
+	EOS_NUT, EOB_NUT, FD_NUT,
+    SEI_PREFIX
 }
-
 #[allow(non_snake_case)] pub fn Intra_Random_Access_Picture(unit: NAL) -> bool { 16 <= unit as u8 && unit as u8 <= 23 }
 #[allow(non_snake_case)] pub fn Instantaneous_Decoder_Refresh(unit: NAL) -> bool { use NAL::*; matches!(unit, IDR_W_RADL|IDR_N_LP) }
 
@@ -145,8 +144,9 @@ fn scaling_list(s: &mut Reader) -> ScalingList {
 struct VPS {}
 
 pub struct PulseCodeModulation { pub bit_depth: u8, pub bit_depth_chroma: u8, pub log2_min_coding_block_size: u8, pub log2_diff_max_min_coding_block_size: u8, pub loop_filter_disable: bool }
-#[derive(Clone,Debug)] pub struct ShortTermReferencePicture { pub delta_poc: i8, pub used: bool }
-#[derive(Clone)] pub struct LongTermReferencePicture { pub poc: u8, pub used: bool }
+#[derive(Clone)] pub struct ShortTermReferencePicture { pub delta_poc: i8, pub used: bool }
+impl std::fmt::Debug for ShortTermReferencePicture { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "{}", self.delta_poc) } }
+#[derive(Clone)] pub struct LongTermReferencePicture { pub poc: u32, pub used: bool }
 
 pub struct SPS {
     pub separate_color_plane: bool,
@@ -203,28 +203,32 @@ pub struct PPS {
     #[allow(dead_code)] pps_extension: ()//bool
 }
 
+//fn dbg<T:std::fmt::Debug>(value: T) -> T { println!("{:?}", &value); value }
+
 fn decode_short_term_reference_picture_set(s: &mut Reader, sets: &[Box<[ShortTermReferencePicture]>], slice_header: bool) -> Box<[ShortTermReferencePicture]> {
     if !sets.is_empty() && /*predict*/s.bit() {
         let ref set = &sets[sets.len()-1-if slice_header {s.ue() as usize} else {0}];
         let delta = if s.bit() { -1 } else { 1 } * (s.exp_golomb_code()) as i8;
         let mut parse = |&ShortTermReferencePicture{delta_poc,..}| { let used = s.bit(); if used || s.bit() { Some(ShortTermReferencePicture{delta_poc:delta_poc+delta, used}) } else { None } };
-        let mut set = set.iter().filter_map(&mut parse).collect::<Vec<_>>();
-        let p = parse(&ShortTermReferencePicture{delta_poc:0,used:false});
-        if let Some(p) = p { set.push(p) }
-        set.into_boxed_slice()
+		let mut set = set.iter().filter_map(&mut parse).collect::<Vec<_>>();
+        set.extend(parse(&ShortTermReferencePicture{delta_poc:0,used:false}));
+        let (mut negative, mut positive) = set.into_iter().partition::<Vec<_>,_>(|&ShortTermReferencePicture{delta_poc,..}| delta_poc<0);
+		negative.sort_by_key(|&ShortTermReferencePicture{delta_poc,..}| -delta_poc);
+		positive.sort_by_key(|&ShortTermReferencePicture{delta_poc,..}| delta_poc);
+		[negative,positive].concat().into_boxed_slice()
     } else {
         let negative = s.ue() as usize;
         let positive = s.ue() as usize;
-        let mut v = Vec::with_capacity(negative+positive);
+        let mut set = Vec::with_capacity(negative+positive);
         type P = ShortTermReferencePicture;
-        {let mut a = 0; for _ in 0..negative { a=a-1-s.ue() as i8; v.push(P{delta_poc: a, used: s.bit()}); }}
-        {let mut a = 0; for _ in 0..positive { a=a+1+s.ue() as i8; v.push(P{delta_poc: a, used: s.bit()}); }}
-        v.into_boxed_slice()
+        {let mut a = 0; for _ in 0..negative { a=a-s.exp_golomb_code() as i8; set.push(P{delta_poc: a, used: s.bit()}); }}
+        {let mut a = 0; for _ in 0..positive { a=a+s.exp_golomb_code() as i8; set.push(P{delta_poc: a, used: s.bit()}); }}
+		set.into_boxed_slice()
     }
 }
 
 pub struct SHReference {
-    pub poc: u8,
+    pub poc: u32,
     pub short_term_pictures: Box<[ShortTermReferencePicture]>,
     pub short_term_picture_set_encoded_bits_len_skip: Option<u32>,
     pub long_term_pictures: Box<[LongTermReferencePicture]>,
@@ -234,7 +238,8 @@ pub struct SHReference {
 #[derive(Clone,Copy,Default)] pub struct MayB<T> { pub p: T, pub b: Option<T> }
 impl<T> MayB<T> {
     fn as_ref(&self) -> MayB<&T> { MayB{p: &self.p, b: self.b.as_ref()} }
-    fn map<U>(self, mut f: impl FnMut(T)->U) -> MayB<U> { MayB{p: f(self.p), b: self.b.map(f)} }
+    pub fn map<U>(self, mut f: impl FnMut(T)->U) -> MayB<U> { MayB{p: f(self.p), b: self.b.map(f)} }
+	pub fn zip<'t, U>(self, o: &'t MayB<U>) -> MayB<(T,&'t U)> { MayB{p: (self.p, &o.p), b: self.b.map(|b| (b, o.b.as_ref().unwrap()))} }
 }
 #[derive(Clone,Default,Debug)] pub struct LumaChroma<L, C=L> { pub luma: L, pub chroma: Option<C> }
 #[derive(Clone,Copy,Default,Debug)] pub struct WeightOffset<W, O> { pub weight: W, pub offset: O }
@@ -243,7 +248,7 @@ pub type WeightOffsets<W, O, const N: usize> = WeightOffset<[W; N],[O; N]>;
 pub type PredictionWeights<const N: usize> = LumaChroma<Tables<WeightOffsets<i8,i8,N>>, Tables<WeightOffsets<[i8;2],[i8;2],N>>>;
 pub struct SHInter {
     pub active_references: MayB<u8>,
-    #[allow(dead_code)] list_entry_lx: Option<MayB<Box<[u8]>>>,
+    pub list_entry_lx: Option<MayB<Option<Box<[u8]>>>>,
     pub mvd_l1_zero: bool,
     pub cabac_init: bool,
     pub collocated_list: Option<(bool, Option<u8>)>,
@@ -260,36 +265,17 @@ pub struct SliceHeader {
     pub inter: Option<SHInter>,
     pub qp_delta: i8,
     pub qp_offsets: Option<(i8, i8)>,
-    //cu_chroma_qp_offset: bool,
     pub deblocking_filter: Option<DeblockingFilter>,
     pub loop_filter_across_slices: bool,
 }
-
-/*pub struct Slice<'t> {
-	escaped_data: &'t [u8],
-	slice_data_byte_offset: usize,
-	dependent_slice_segment: bool,
-	slice_segment_address: Option<usize>
-}*/
 
 pub struct HEVC {
 	vps : [Option<VPS>; 16],
 	sps : [Option<SPS>; 16],
 	pps: [Option<PPS>; 64],
 	slice_header: Option<SliceHeader>,
-	//deferred_slice: Option<Slice<'t>>,
+	poc_tid0: u32,
 }
-
-/*enum Event<'t> {
-	Sequence(&'t SPS),
-	//Picture{pps: &'t PPS, sps: &'t SPS, nal: NAL, reference: Option<&'t SHReference>},
-	Slice{
-		slice_header: &'t Option<SliceHeader>, /*slice: Slice<'t>,*/escaped_data: &'t [u8],
-		slice_data_byte_offset: usize,
-		dependent_slice_segment: bool,
-		slice_segment_address: Option<usize>, last: bool},
-	EndCluster,
-}*/
 
 pub struct Slice<'t> {
 	pub sps: &'t SPS,
@@ -309,7 +295,7 @@ fn unit<'i: 'o,'o>(&'i mut self, escaped_data: &'i [u8]) -> Option<Slice<'o>> {
 	assert!(s.bit() == false); //forbidden_zero_bit
 	//let _ref_idc = s.bits(2);
 	let unit = NAL::from_u32(s.bits(/*5*/6)).unwrap();
-	let _temporal_id = if !false/*matches!(unit_type, EOS_NUT|EOB_NUT)*/ {
+	let temporal_id = if !matches!(unit, NAL::EOS_NUT|NAL::EOB_NUT) {
 		let _layer_id = s.bits(6);
 		s.bits(3) - 1
 	} else { 0 };
@@ -426,7 +412,7 @@ fn unit<'i: 'o,'o>(&'i mut self, escaped_data: &'i [u8]) -> Option<Slice<'o>> {
 				sets.into_boxed_slice()
 			};
 			//println!("SPS {id} {short_term_reference_picture_sets:?}");
-			let long_term_reference_picture_set = s.bit().then(|| (0..s.ue()).map(|_| LongTermReferencePicture{poc: s.bits(log2_max_poc_lsb) as u8, used: s.bit()}).collect());
+			let long_term_reference_picture_set = s.bit().then(|| (0..s.ue()).map(|_| LongTermReferencePicture{poc: s.bits(log2_max_poc_lsb), used: s.bit()}).collect());
 			let temporal_motion_vector_predictor = s.bit();
 			let strong_intra_smoothing = s.bit();
 			if s.bit() { // VUI
@@ -549,22 +535,22 @@ fn unit<'i: 'o,'o>(&'i mut self, escaped_data: &'i [u8]) -> Option<Slice<'o>> {
 				let output = pps.output && s.bit();
 				let color_plane_id = if sps.separate_color_plane { s.bits(2) } else { 0 } as u8;
 				let reference = (!Instantaneous_Decoder_Refresh(unit)).then(|| {
-					let poc_lsb = s.bits(sps.log2_max_poc_lsb) as u8;
-					/*println!("{}", sps.log2_max_poc_lsb);
-					let max_poc_lsb = 1 << sps.log2_max_poc_lsb;
-					let prev_poc_lsb = poc_tid0 % max_poc_lsb;
-					let prev_poc_msb = poc_tid0 - prev_poc_lsb;
+					let poc_lsb = s.bits(sps.log2_max_poc_lsb) as u16;
+					let max_poc_lsb = (1 << sps.log2_max_poc_lsb) as u16;
+					let prev_poc_lsb = (self.poc_tid0 % max_poc_lsb as u32) as u16;
+					let prev_poc_msb = self.poc_tid0 - prev_poc_lsb as u32;
 					let poc_msb = if poc_lsb < prev_poc_lsb && prev_poc_lsb - poc_lsb >= max_poc_lsb / 2 {
-						prev_poc_msb + max_poc_lsb
+						prev_poc_msb + max_poc_lsb as u32
 					} else if poc_lsb > prev_poc_lsb && poc_lsb - prev_poc_lsb > max_poc_lsb / 2 {
-						prev_poc_msb - max_poc_lsb
+						prev_poc_msb - max_poc_lsb as u32
 					} else {
 						prev_poc_msb
-					};*/
-					let poc = (/*if /*matches!(unit, BLA_W_RADL|BLA_W_LP|BLA_N_LP)*/false { 0 } else { poc_msb } +*/ poc_lsb) as u8;
+					};
+					let poc = if matches!(unit, NAL::BLA_W_RADL|NAL::BLA_W_LP|NAL::BLA_N_LP) { 0 } else { poc_msb } + poc_lsb as u32;
+					//if temporal_id == 0 && !matches!(unit,NAL::TRAIL_N|NAL::TSA_N|NAL::STSA_N|NAL::RADL_N|NAL::RASL_N|NAL::RADL_R|NAL::RASL_R) { self.poc_tid0 = poc; }
 					let (short_term_picture_set, short_term_picture_set_encoded_bits_len_skip) = if !s.bit() { let start = s.available()+1; (decode_short_term_reference_picture_set(s, &sps.short_term_reference_picture_sets, true), Some((start - s.available()) as u32)) }
 					else {
-						let set = if sps.short_term_reference_picture_sets.len()>1 { s.bits(ceil_log2(sps.short_term_reference_picture_sets.len()-1<<1)) as usize } else { 0 };
+						let set = if sps.short_term_reference_picture_sets.len()>1 { s.bits(ceil_log2(sps.short_term_reference_picture_sets.len())) as usize } else { 0 };
 						(sps.short_term_reference_picture_sets[set].clone(), None)
 					};
 					SHReference{
@@ -573,18 +559,19 @@ fn unit<'i: 'o,'o>(&'i mut self, escaped_data: &'i [u8]) -> Option<Slice<'o>> {
 							let sequence = if !set.is_empty() { s.ue() } else { 0 };
 							let slice = s.ue();
 							let mut v = Vec::with_capacity((sequence+slice) as usize);
-							let poc = |s: &mut Reader, msb: &mut u8| -> u8 { if !s.bit() { 0 } else {
-								*msb += s.ue() as u8;
-								poc - *msb << sps.log2_max_poc_lsb - poc_lsb
+							let poc = |s: &mut Reader, msb: &mut u16| -> u32 { if !s.bit() { 0 } else {
+								*msb += s.ue() as u16;
+								poc - ((*msb as u32) << sps.log2_max_poc_lsb) - poc_lsb as u32
 							}};
 							v.extend((0..sequence).scan(0, |msb, _| { let mut p = set[if set.len() > 1 { s.bits(ceil_log2(set.len())) } else { 0 } as usize].clone(); p.poc += poc(s, msb); Some(p)}));
-							v.extend((0..slice).scan(0, |msb, _| { let mut p = LongTermReferencePicture{poc: s.bits(sps.log2_max_poc_lsb) as u8, used: s.bit()}; p.poc += poc(s, msb); Some(p)}));
+							v.extend((0..slice).scan(0, |msb, _| { let mut p = LongTermReferencePicture{poc: s.bits(sps.log2_max_poc_lsb), used: s.bit()}; p.poc += poc(s, msb); Some(p)}));
 							v.into_boxed_slice()
 						}).unwrap_or_default(),
 						temporal_motion_vector_predictor: sps.temporal_motion_vector_predictor && s.bit()
 					}
 				});
 				//if temporal_id == 0 && !matches!(unit, TRAIL_N/*|TSA_N|STSA_N|RADL_N|RASL_N|RADL_R|RASL_R*/) { poc_tid0 = reference.as_ref().map(|r| r.poc).unwrap_or(0); }
+				if temporal_id == 0 && !matches!(unit, NAL::TRAIL_N|NAL::TSA_N|NAL::STSA_N|NAL::RADL_N|NAL::RASL_N|NAL::RADL_R|NAL::RASL_R) { self.poc_tid0 = reference.as_ref().map(|r| r.poc).unwrap_or(0); }
 				let chroma = sps.chroma_format_idc>0;
 				let sample_adaptive_offset = sps.sample_adaptive_offset.then(|| LumaChroma{luma: s.bit(), chroma: chroma.then(|| s.bit())}).unwrap_or(LumaChroma{luma: false, chroma: chroma.then(|| false)});
 				let inter = matches!(slice_type, SliceType::P | SliceType::B).then(|| {
@@ -596,7 +583,7 @@ fn unit<'i: 'o,'o>(&'i mut self, escaped_data: &'i [u8]) -> Option<Slice<'o>> {
 					let references_len = reference.short_term_pictures.iter().filter(|p| p.used).count() + reference.long_term_pictures.iter().filter(|p| p.used).count();
 					SHInter{
 						active_references,
-						list_entry_lx: (pps.lists_modification && references_len > 1).then(|| active_references.map(|len| (0..len).map(|_| s.bits(ceil_log2(references_len)) as u8).collect::<Box<_>>())),
+						list_entry_lx: (pps.lists_modification && references_len > 1).then(|| active_references.map(|len| s.bit().then(|| (0..len).map(|_| s.bits(ceil_log2(references_len)) as u8).collect::<Box<_>>()))),
 						mvd_l1_zero: b && s.bit(),
 						cabac_init: pps.cabac_init && s.bit(),
 						collocated_list: reference.temporal_motion_vector_predictor.then(|| {
@@ -628,10 +615,11 @@ fn unit<'i: 'o,'o>(&'i mut self, escaped_data: &'i [u8]) -> Option<Slice<'o>> {
 				self.slice_header = Some(SliceHeader{slice_type, output, color_plane_id, reference, sample_adaptive_offset, inter, qp_delta, qp_offsets, deblocking_filter, loop_filter_across_slices});
 			} // !dependent_slice_segment
 			let slice_data_byte_offset = (s.bits_offset() + 1 + 7) / 8; // Add 1 to the bits count here to account for the byte_alignment bit, which always is at least one bit and not accounted for otherwise
-			assert!(slice_data_byte_offset <= 8); // Assumes no escape
+			assert!(slice_data_byte_offset <= 12, "{slice_data_byte_offset}"); // Assumes no escape
 			//*if first_slice { picture(context.sequence.as_mut().unwrap(), pps, sps, unit, context.slice_header.as_ref().unwrap().reference.as_ref()) }
 			return Some(Slice{pps, sps, unit, slice_header: self.slice_header.as_ref().unwrap(), escaped_data, slice_data_byte_offset, dependent_slice_segment, slice_segment_address});
 		}
+		_ => unimplemented!(),
 	}
 	None
 }
@@ -641,7 +629,7 @@ pub fn parse(input: &[u8], mut dispatch: impl FnMut(Slice, bool)) {
     let tracks = demuxer.tracks.unwrap();
     let video = &tracks.tracks[0];
     assert!(video.codec_id == "V_MPEGH/ISO/HEVC");
-	let mut context = Self{vps: Default::default(), sps: Default::default(), pps: [();_].map(|_|None), slice_header: None};
+	let mut context = Self{vps: Default::default(), sps: Default::default(), pps: [();_].map(|_|None), slice_header: None, poc_tid0: 0};
 	{
 	let s = &video.codec_private.as_ref().unwrap()[22..];
 	let (&count, s) = s.split_first().unwrap();
