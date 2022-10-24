@@ -615,7 +615,7 @@ fn unit<'i: 'o,'o>(&'i mut self, escaped_data: &'i [u8]) -> Option<Slice<'o>> {
 				self.slice_header = Some(SliceHeader{slice_type, output, color_plane_id, reference, sample_adaptive_offset, inter, qp_delta, qp_offsets, deblocking_filter, loop_filter_across_slices});
 			} // !dependent_slice_segment
 			let slice_data_byte_offset = (s.bits_offset() + 1 + 7) / 8; // Add 1 to the bits count here to account for the byte_alignment bit, which always is at least one bit and not accounted for otherwise
-			assert!(slice_data_byte_offset <= 12, "{slice_data_byte_offset}"); // Assumes no escape
+			assert!(slice_data_byte_offset <= 36, "{slice_data_byte_offset}"); // Assumes no escape
 			//*if first_slice { picture(context.sequence.as_mut().unwrap(), pps, sps, unit, context.slice_header.as_ref().unwrap().reference.as_ref()) }
 			return Some(Slice{pps, sps, unit, slice_header: self.slice_header.as_ref().unwrap(), escaped_data, slice_data_byte_offset, dependent_slice_segment, slice_segment_address});
 		}

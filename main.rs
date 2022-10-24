@@ -46,7 +46,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let packet = unsafe{av_packet_alloc()};
         let mut av = Vec::new();
-        while av.len()<136 && unsafe{av_read_frame(context, packet)} >= 0 {
+        while av.len()<187 && unsafe{av_read_frame(context, packet)} >= 0 {
             if video_stream == unsafe{&*packet}.stream_index {
                 check(unsafe{avcodec_send_packet(decoder_context, packet)});
                 assert!(unsafe{&mut *decoder_context}.hwaccel != std::ptr::null());
@@ -119,6 +119,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut ids = [0; _];
             check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_YUV420_10, sps.width as _, sps.height as _, ids.as_mut_ptr(), ids.len() as _, std::ptr::null_mut(), 0)});
             ids.reverse(); // to match AV
+            //ids = [19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0].map(|i| ids[i]); // to match AV
             Context{context: {
                 let mut context = 0;
                 check(unsafe{va::vaCreateContext(va, config, sps.width as _, sps.height as _, va::VA_PROGRESSIVE as _, ids.as_ptr() as *mut _, ids.len() as _, &mut context)});
@@ -132,24 +133,27 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             *buffer_count += 1;
             if let Some(av) = av.pop_front() {
                 assert_eq!(r#type, av.0);
-                if data != av.1 {
+                let (a, b) = (data, av.1);
+                if a != b {
                     println!("{}", r#type);
-                    for chunk in data.iter().zip(av.1).array_chunks::<64>() {
+                    for chunk in a.iter().zip(b).array_chunks::<64>() {
                         let (a,b) = chunk.iter().map(|(a,b)| { let f = if a==b { "\x1b[0m" } else { "\x1b[31m" }.to_string(); (f.clone()+&format!("{a:02x}"), f+&format!("{b:02x}")) }).unzip::<_,_,Vec<_>,Vec<_>>();
                         println!("+ {}", &a.array_chunks::<16>().map(|x| x.concat()+" ").format(""));
                         println!("- {}", &b.array_chunks::<16>().map(|x| x.concat()+" ").format(""));
                     }
-                    panic!();/*if ![0/*,1,3,5,7,9,11,13,15*/].contains(&i) {
-                        if r#type == 4 {
-                            let a = unsafe{&*(a.as_ptr() as *const va::VASliceParameterBufferHEVC)};
-                            let b = unsafe{&*(b.as_ptr() as *const va::VASliceParameterBufferHEVC)};
-                            if bytes_of(a) != bytes_of(b) {
-                                println!("{:0b}", unsafe{a.LongSliceFlags.value});
-                                println!("{:0b}", unsafe{b.LongSliceFlags.value});
-                            }
+                    if r#type != 0 /*|| a[1..]!=b[1..]*/ {
+                        if r#type == 0 {
+                            assert!(a.len() == std::mem::size_of::<va::VAPictureParameterBufferHEVC>());
+                            assert!(a.len() == b.len());
+                            let a = unsafe{&*(a.as_ptr() as *const va::VAPictureParameterBufferHEVC)};
+                            let b = unsafe{&*(b.as_ptr() as *const va::VAPictureParameterBufferHEVC)};
+                            //macro_rules field { ($field:id) => { assert_eq!(a.$field, b.$field); } };
+                            impl std::cmp::PartialEq for va::VAPictureHEVC { fn eq(&self, b: &Self) -> bool { self.picture_id == b.picture_id && self.pic_order_cnt == b.pic_order_cnt && self.flags == b.flags } }
+                            assert_eq!(a.CurrPic, b.CurrPic);
+                            for (a,b) in a.ReferenceFrames.iter().zip(b.ReferenceFrames) { assert_eq!(a,&b); }
                         }
                         panic!();
-                    }*/
+                    }
                 }
             }
             let mut buffer = 0;
@@ -163,8 +167,13 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("POC {}", current_poc);
             println!("DPB [{}]", frames.iter().filter_map(|f| f.poc).format(" "));
             reference.map(|r| println!("refs [{};{}]", r.short_term_pictures.iter().map(|p| (current_poc as i32+p.delta_poc as i32) as u32).format(" "),r.long_term_pictures.iter().map(|p| p.poc).format(" ")));
-            for Frame{poc: frame_poc,..} in frames.iter_mut() {
+
+            let current_id = frames.iter().find(|f| f.poc.is_none()).unwrap().id;
+
+            /*for Frame{poc: frame_poc,..} in frames.iter_mut() {
                 *frame_poc = frame_poc.filter(|&frame_poc| reference.map(|r| r.short_term_pictures.iter().any(|p| ((current_poc as i32+p.delta_poc as i32) as u32) == frame_poc) || r.long_term_pictures.iter().any(|p| p.poc == frame_poc)).unwrap_or(false));
+            }*/for Frame{poc: frame_poc,id,..} in frames.iter_mut() {
+                *frame_poc = frame_poc.filter(|&frame_poc| reference.map(|r| r.short_term_pictures.iter().any(|p| ((current_poc as i32+p.delta_poc as i32) as u32) == frame_poc) || r.long_term_pictures.iter().any(|p| p.poc == frame_poc)).unwrap_or(false) || *id == current_id);
             }
 
             #[allow(non_snake_case)] let ReferenceFrames = from_iter_or(frames.iter().filter_map(|frame| {
@@ -186,13 +195,14 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             }), va::VAPictureHEVC{picture_id:0xFFFFFFFF,pic_order_cnt:0,flags:va::VA_PICTURE_HEVC_INVALID,va_reserved:[0;_]}); // before setting current.poc
 
-            let current = frames.iter_mut().find(|f| f.poc.is_none()).unwrap();
+            /*let current = frames.iter_mut().find(|f| f.poc.is_none()).unwrap();
             assert!(current.poc.is_none());
-            current.poc = Some(current_poc); // after setting ReferenceFrames
+            current.poc = Some(current_poc); // after setting ReferenceFrames*/
+            frames.iter_mut().find(|f| f.id == current_id).unwrap().poc = Some(current_poc); // after setting ReferenceFrames
 
             render(va::VABufferType_VAPictureParameterBufferType, bytes_of(&va::VAPictureParameterBufferHEVC{
                 CurrPic: va::VAPictureHEVC {
-                    picture_id: current.id,
+                    picture_id: current_id,
                     pic_order_cnt: current_poc as i32,
                     flags: 0,
                     va_reserved: [0; 4],
@@ -291,7 +301,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } as *const _ as *mut _, &mut buffer)});
                 check(unsafe{va::vaRenderPicture(va, context, &buffer as *const _ as *mut _, 1)});*/
             }
-            current.id
+            //*current.id
+            current_id
         });
         let prediction_weights = slice_header.inter.as_ref().map(|s| s.prediction_weights.clone()).flatten().unwrap_or_default();
         let sh=&slice_header;
@@ -302,11 +313,12 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             slice_data_byte_offset: slice_data_byte_offset as u32,
             slice_segment_address: slice_segment_address.unwrap_or(0) as u32,
             RefPicList: slice_header.reference.as_ref().map(|r| {
-                fn index(frames: &[Frame], ref_poc: u32) -> usize { frames.iter().filter_map(|frame| frame.poc).position(|poc| poc == ref_poc).unwrap() }
                 pub fn list<T>(iter: impl std::iter::IntoIterator<Item=T>) -> Box<[T]> { iter.into_iter().collect() }
                 pub fn sort_by<T>(mut s: Box<[T]>, f: impl Fn(&T,&T)->std::cmp::Ordering) -> Box<[T]> { s.sort_by(f); s }
                 pub fn map<T,U>(iter: impl std::iter::IntoIterator<Item=T>, f: impl Fn(T)->U) -> Box<[U]> { list(iter.into_iter().map(f)) }
-                fn stps(frames: &[Frame], r: &hevc::SHReference, f: impl Fn(std::cmp::Ordering)->std::cmp::Ordering) -> Box<[u8]> {
+                let ref frames = frames.iter().filter(|frame| frame.poc.map(|poc| poc != r.poc).unwrap_or(false)).map(|frame| frame.poc.unwrap()).collect::<Box<_>>();
+                fn index(frames: &[u32], ref_poc: u32) -> usize { frames.iter().position(|&poc| poc == ref_poc).unwrap() }
+                fn stps(frames: &[u32], r: &hevc::SHReference, f: impl Fn(std::cmp::Ordering)->std::cmp::Ordering) -> Box<[u8]> {
                     let current_poc = r.poc;
                     map(&*sort_by(
                         list(r.short_term_pictures.into_iter().filter_map(|&hevc::ShortTermReferencePicture{delta_poc, used}|(used && f(delta_poc.cmp(&0)) == std::cmp::Ordering::Greater).then(|| delta_poc))),
