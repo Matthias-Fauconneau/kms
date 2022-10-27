@@ -5,11 +5,11 @@ fn main() {
     //eprintln!("{:?}", &files);
     cc::Build::new().includes([".","/usr/include/drm"]).define("HAVE_AV_CONFIG_H","").extra_warnings(false).files(files).compile("av");*/
 
-    println!("cargo:rerun-if-changed=av.h");
+    /*println!("cargo:rerun-if-changed=av.h");
     bindgen::builder().clang_arg("-I.").header("av.h").allowlist_function("av.*").allowlist_var("AV.*").parse_callbacks(Box::new(bindgen::CargoCallbacks))/*.derive_default(true)*/.layout_tests(false).generate_comments(false).generate().unwrap()
         .write_to_file(std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("av.rs")).unwrap();
     println!("cargo:rustc-link-search=.");
-    println!("cargo:rustc-link-lib=av");
+    println!("cargo:rustc-link-lib=av");*/
     /*println!("cargo:rustc-link-lib=avcodec");
     println!("cargo:rustc-link-lib=avformat");
     println!("cargo:rustc-link-lib=avutil");*/

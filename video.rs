@@ -1,9 +1,8 @@
+#![allow(dead_code)]
 use crate::array;
 fn ceil_log2(x: usize) -> u8 { ((x-1)<<1).ilog2() as u8 }
 
-use nom::combinator::iterator;
-use nom::number::complete::be_u32;
-fn unit(input: &[u8]) -> nom::IResult<&[u8], &[u8]> { let (rest, length) = be_u32(input)?; let length = length as usize; Ok((&rest[length..], &rest[..length])) }
+fn unit(input: &[u8]) -> nom::IResult<&[u8], &[u8]> { let (rest, length) = nom::number::complete::be_u32(input)?; let length = length as usize; Ok((&rest[length..], &rest[..length])) }
 
 #[allow(non_camel_case_types)] #[repr(u8)] #[derive(Clone,Copy,num_derive::FromPrimitive,Debug)] pub enum NAL {
     TRAIL_N, TRAIL_R, TSA_N, TSA_R, STSA_N, STSA_R, RADL_N, RADL_R, RASL_N, RASL_R,
@@ -176,7 +175,7 @@ pub struct SPS {
 pub struct Tiles {pub columns: Box<[u16]>, pub rows: Box<[u16]>, pub loop_filter_across_tiles: bool}
 
 pub struct PPS {
-    sps: usize,
+    pub sps: usize,
     pub dependent_slice_segments: bool,
     pub output: bool,
     pub num_extra_slice_header_bits: u8,
@@ -202,8 +201,6 @@ pub struct PPS {
     pub slice_header_extension: bool,
     #[allow(dead_code)] pps_extension: ()//bool
 }
-
-//fn dbg<T:std::fmt::Debug>(value: T) -> T { println!("{:?}", &value); value }
 
 fn decode_short_term_reference_picture_set(s: &mut Reader, sets: &[Box<[ShortTermReferencePicture]>], slice_header: bool) -> Box<[ShortTermReferencePicture]> {
     if !sets.is_empty() && /*predict*/s.bit() {
@@ -271,17 +268,15 @@ pub struct SliceHeader {
 
 pub struct HEVC {
 	vps : [Option<VPS>; 16],
-	sps : [Option<SPS>; 16],
-	pps: [Option<PPS>; 64],
-	slice_header: Option<SliceHeader>,
+	pub sps : [Option<SPS>; 16],
+	pub pps: [Option<PPS>; 64],
+	pub slice_header: Option<SliceHeader>,
 	poc_tid0: u32,
 }
 
 pub struct Slice<'t> {
-	pub sps: &'t SPS,
-	pub pps: &'t PPS,
+	pub pps: usize,
 	pub unit: NAL,
-	pub slice_header: &'t SliceHeader,
 	pub escaped_data: &'t [u8],
 	pub slice_data_byte_offset: usize,
 	pub dependent_slice_segment: bool,
@@ -289,7 +284,7 @@ pub struct Slice<'t> {
 }
 
 impl HEVC {
-fn unit<'i: 'o,'o>(&'i mut self, escaped_data: &'i [u8]) -> Option<Slice<'o>> {
+fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 	let data = escaped_data[0..2].iter().copied().chain(escaped_data.array_windows().filter_map(|&[a,b,c]| (!(a == 0 && b== 0 && c == 3)).then(|| c))).collect::<Vec<u8>>();
 	let ref mut s = Reader::new(&data);
 	assert!(s.bit() == false); //forbidden_zero_bit
@@ -520,8 +515,9 @@ fn unit<'i: 'o,'o>(&'i mut self, escaped_data: &'i [u8]) -> Option<Slice<'o>> {
 			//println!("{unit:?}");
 			let first_slice = s.bit();
 			if Intra_Random_Access_Picture(unit) { let _no_output_of_prior_pics = s.bit(); }
-			let pps = {let id = s.ue() as usize; /*println!("use PPS {id}");*/ self.pps[id].as_ref().unwrap_or_else(|| panic!("{id}"))};
-			let ref sps = self.sps[pps.sps].as_ref().unwrap_or_else(|| panic!("{}", pps.sps));
+			let pps_id = s.ue() as usize;
+			let pps = self.pps[pps_id].as_ref().unwrap();
+			let ref sps = self.sps[pps.sps].as_ref().unwrap();
 			let (dependent_slice_segment, slice_segment_address) = if !first_slice {
 				let dependent_slice_segment = pps.dependent_slice_segments && s.bit();
 				let log2_ctb_size = sps.log2_min_coding_block_size + sps.log2_diff_max_min_coding_block_size;
@@ -617,54 +613,172 @@ fn unit<'i: 'o,'o>(&'i mut self, escaped_data: &'i [u8]) -> Option<Slice<'o>> {
 			let slice_data_byte_offset = (s.bits_offset() + 1 + 7) / 8; // Add 1 to the bits count here to account for the byte_alignment bit, which always is at least one bit and not accounted for otherwise
 			assert!(slice_data_byte_offset <= 36, "{slice_data_byte_offset}"); // Assumes no escape
 			//*if first_slice { picture(context.sequence.as_mut().unwrap(), pps, sps, unit, context.slice_header.as_ref().unwrap().reference.as_ref()) }
-			return Some(Slice{pps, sps, unit, slice_header: self.slice_header.as_ref().unwrap(), escaped_data, slice_data_byte_offset, dependent_slice_segment, slice_segment_address});
+			return Some(Slice{pps: pps_id, unit, escaped_data, slice_data_byte_offset, dependent_slice_segment, slice_segment_address});
 		}
 		_ => unimplemented!(),
 	}
 	None
+}}
+
+use nom::combinator::ParserIterator;
+type Segments<'t> = ParserIterator<&'t [u8], matroska::ebml::Error<'t>, for<'a> fn(&'a [u8])->nom::IResult<&'a [u8], matroska::elements::SegmentElement<'a>, matroska::ebml::Error<'a>>>;
+type Blocks<'t> = std::vec::IntoIter<&'t [u8]>;
+type Units<'t> = ParserIterator<&'t [u8], nom::error::Error<&'t [u8]>, for<'a> fn(&'a [u8])->nom::IResult<&'a [u8], &'a [u8], nom::error::Error<&'a [u8]>>>;
+pub struct State<'t> {video_track_number: u64, segments: Segments<'t>}
+pub enum Matroska<'t> {
+	Point0(State<'t>),
+	Point1(State<'t>, Blocks<'t>, Units<'t>, &'t [u8]),
+	Point2(State<'t>, Blocks<'t>),
+	Done,
 }
-pub fn parse(input: &[u8], mut dispatch: impl FnMut(Slice, bool)) {
+
+pub fn matroska<'t>(input: &'t [u8]) -> Result<(Matroska<'t>, HEVC), nom::Err<matroska::ebml::Error>> {
+	use nom::combinator::iterator;
 	let mut demuxer = matroska::demuxer::MkvDemuxer::new();
-    let (input, ()) = demuxer.parse_until_tracks(input).unwrap();
+    let (input, ()) = demuxer.parse_until_tracks(input)?;
     let tracks = demuxer.tracks.unwrap();
     let video = &tracks.tracks[0];
     assert!(video.codec_id == "V_MPEGH/ISO/HEVC");
-	let mut context = Self{vps: Default::default(), sps: Default::default(), pps: [();_].map(|_|None), slice_header: None, poc_tid0: 0};
-	{
+	let mut hevc = HEVC{vps: Default::default(), sps: Default::default(), pps: [();_].map(|_|None), slice_header: None, poc_tid0: 0};
 	let s = &video.codec_private.as_ref().unwrap()[22..];
-	let (&count, s) = s.split_first().unwrap();
-	let mut s = s; for _ in 0..count { s = {
+	let (&count, mut s) = s.split_first().unwrap();
+	for _ in 0..count { s = {
 		let (_, s) = s.split_first().unwrap();
 		let (count, s) = {let (v, s) = s.split_at(2); (u16::from_be(unsafe{*(v as *const _ as *const u16)}), s)};
 		let mut s = s; for _ in 0..count { s = {
 			let (length, s) = {let (v, s) = s.split_at(2); (u16::from_be(unsafe{*(v as *const _ as *const u16)}), s)};
 			let (unit, s) = s.split_at(length as usize);
-			assert!(context.unit(unit).is_none());
+			assert!(hevc.unit(unit).is_none());
 			s
 		}}
 		s
 	}}
-	}
-	for element in &mut iterator(input, matroska::elements::segment_element) { use matroska::elements::SegmentElement::*; match element {
+	let video_track_number = video.track_number;
+	let segments = iterator(input, matroska::elements::segment_element as _);
+	/*let slices = crate::lending::from_generator({move || {let mut input = input; for element in &mut input { use matroska::elements::SegmentElement::*; match element {
 		Void(_) => {},
 		Cluster(cluster) => for data_block in cluster.simple_block {
 			let (data, block) = matroska::elements::simple_block(data_block).unwrap();
-			if block.track_number == video.track_number {
-				let mut deferred_slice = None;
+			if block.track_number == video_track_number {
+				let mut slice = None;
 				for unit in &mut iterator(data, unit) {
-					//if let Some(slice) = context.deferred_slice.take() { dispatch(Unit::Slice{slice_header: context.slice_header.as_ref().unwrap(), slice, last: false}); }
-					if let Some(slice) = deferred_slice.take() { dispatch(slice, false); }
-					deferred_slice = context.unit(unit);
+					if let Some(slice) = slice.take() { yield (slice, false); }
+					slice = hevc.unit(unit);
 				}
-				/*if first_slice { picture(context.sequence.as_mut().unwrap(), pps, sps, unit, context.slice_header.as_ref().unwrap().reference.as_ref()) }
-				if let Some(slice) = context.deferred_slice.take() { dispatch(Unit::Slice{slice_header: context.slice_header.as_ref().unwrap(), slice, last: true}); }
-				dispatch(Unit::EndCluster);*/
-				dispatch(deferred_slice.take().unwrap(), true);
+				yield (slice.take().unwrap(), true);
 			}
 		},
 		Cues(_) => {},
 		Chapters(_) => {},
 		_ => panic!("{element:?}")
-	}}
+}}}*/
+	use std::ops::GeneratorState as YieldedComplete;
+	impl<'t> std::ops::Generator<&mut HEVC> for Matroska<'t> {
+		type Yield = (Slice<'t>, bool);
+		type Return = ();
+		fn resume(mut self: std::pin::Pin<&mut Self>, hevc: &mut HEVC) -> YieldedComplete<Self::Yield, Self::Return> {
+			type YieldedComplete0<'t> = YieldedComplete<(Slice<'t>, bool), ()>;
+			use Matroska::*;
+			fn segments<'t: 'y, 's: 'y, 'y>(hevc: &mut HEVC, mut state: State<'t>) -> (Matroska<'t>, YieldedComplete0<'y>) {
+				while let Some(element) = (&mut state.segments).next() { use matroska::elements::SegmentElement::*; match element {
+					Void(_) => {},
+					Cluster(cluster) => {
+						let mut blocks = cluster.simple_block.into_iter();
+						while let Some(block) = blocks.next() {
+							let (data, block) = matroska::elements::simple_block(block).unwrap();
+							if block.track_number == state.video_track_number {
+								let mut units = iterator(data, unit as _);
+								while let Some(unit) = (&mut units).next() {
+									if let Some(slice) = hevc.unit(unit) {
+										return if let Some(unit) = (&mut units).next() {
+											(Point1(state, blocks, units, unit), YieldedComplete::Yielded((slice, false)))
+										} else {
+											(Point2(state, blocks), YieldedComplete::Yielded((slice, true)))
+										}
+									}
+								}
+							}
+						}
+					}
+					Cues(_) => {},
+					Chapters(_) => {},
+					_ => panic!("{element:?}")
+				}}
+				(Done, YieldedComplete::Complete(()))
+			}
+			let (point, yielded_complete) = match std::mem::replace(&mut *self, Done) {
+				Point0(state) => segments(hevc, state),
+				Point1(state, blocks, mut units, unit) => {
+					let Some(slice) = hevc.unit(unit) else {unreachable!()};
+					if let Some(unit) = (&mut units).next() {
+						(Point1(state, blocks, units, unit), YieldedComplete::Yielded((slice, false)))
+					} else {
+						(Point2(state, blocks), YieldedComplete::Yielded((slice, true)))
+					}
+				},
+				Point2(state, mut blocks) => '_yield: {
+					while let Some(data_block) = blocks.next() {
+						let (data, block) = matroska::elements::simple_block(data_block).unwrap();
+						if block.track_number == state.video_track_number {
+							let mut units = iterator(data, self::unit as _);
+							while let Some(unit) = (&mut units).next() {
+								if let Some(slice) = hevc.unit(unit) {
+									break '_yield if let Some(unit) = (&mut units).next() {
+										(Point1(state, blocks, units, unit), YieldedComplete::Yielded((slice, false)))
+									} else {
+										(Point2(state, blocks), YieldedComplete::Yielded((slice, false)))
+									}
+								}
+							}
+						}
+					}
+					segments(hevc, state)
+				},
+				Done => unreachable!()
+			};
+			*self = point;
+			yielded_complete
+		}
+	}
+	Ok((Matroska::Point0(State{video_track_number, segments}), hevc))
 }
+
+/*use std::ops::ControlFlow;
+pub trait IteratorRef: Sized {
+    type Ref;
+	type Item;
+    fn next</*'s: 't,*/ 't, B, F: FnMut(&'t Self::Ref, Self::Item) -> B>(&/*'s*/ mut self, f: F) -> ControlFlow<(), B> where Self::Ref: 't;
+    fn filter_map<'t, B, F: FnMut(&'t Self::Ref, Self::Item) -> Option<B>>(self, f: F) -> FilterMap<'t, Self, F> where Self::Ref: 't { FilterMap{iter: self, f, _marker: std::marker::PhantomData} }
 }
+pub struct FilterMap<'t, I,F>{iter: I, f: F, _marker: std::marker::PhantomData<&'t ()>}
+
+/*pub trait Iterator<'t> {
+	type Item;
+    fn next<'s: 't>(&'s mut self) -> Option<Self::Item>;
+}*/
+
+impl<'t, I: IteratorRef, B, F: FnMut(&'t I::Ref, I::Item) -> Option<B>> Iterator/*<'t>*/ for FilterMap<'t, I, F> where I::Ref: 't {
+    type Item = B;
+    //fn next<'s: 't>(&'s mut self) -> Option<Self::Item> {
+	fn next(&mut self) -> Option<Self::Item> {
+		while let ControlFlow::Continue(x) = self.iter.next(&mut self.f) {
+			if let Some(x) = x { return Some(x); }
+		}
+		None
+	}
+}
+
+pub struct FromGenerator<G>(G);
+use std::ops::{Generator, GeneratorState};
+impl<R, Y, G: for<'r> Generator<&'r mut R, Return=(), Yield=Y> + Unpin> IteratorRef for FromGenerator<(G, R)> {
+    type Ref = R;
+	type Item = Y;
+    fn next</*'s:'t,*/ 't, B, F: FnMut(&'t Self::Ref, Self::Item) -> B>(&/*'s*/ mut self, mut f: F) -> ControlFlow<(), B> where Self::Ref: 't {
+		match std::pin::Pin::new(&mut self.0.0).resume(&mut self.0.1) {
+			GeneratorState::Yielded(n) => ControlFlow::Continue(f(&self.0.1, n)),
+			GeneratorState::Complete(()) => ControlFlow::Break(()),
+		}
+	}
+}
+pub fn from_generator<G>(generator: G) -> FromGenerator<G> { FromGenerator(generator) }*/
+

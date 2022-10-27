@@ -6,6 +6,7 @@ bindgen='*'
 cc={version='*', features=['parallel']}
 
 [dependencies]
+#internal-iterator='*'
 itertools='*'
 num-derive='*'
 num-traits='*'
@@ -22,5 +23,5 @@ vector={git='https://github.com/Matthias-Fauconneau/vector'}
 image={git='https://github.com/Matthias-Fauconneau/image'}
 ui={git='https://github.com/Matthias-Fauconneau/ui'}
 
-#[patch.'https://github.com/Matthias-Fauconneau/ui']
-#ui={path='../ui'}
+[patch.'https://github.com/Matthias-Fauconneau/ui']
+ui={path='../ui'}
