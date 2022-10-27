@@ -29,12 +29,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let card = Card::new();
     let mut decoder = va::Decoder::new(&card);
     ui::run(&mut Player(move || loop { match std::ops::Generator::resume(std::pin::Pin::new(&mut matroska), &mut hevc) {
-        std::ops::GeneratorState::Yielded((slice,last)) => {
-            let slice_header = hevc.slice_header.as_ref().unwrap();
-            let reference = slice_header.reference.as_ref();
-            //reference.map(|r| println!("{}", r.poc));
-            if let Some(image) = decoder.slice(&hevc, slice, last) { return image; }
-        }
+        std::ops::GeneratorState::Yielded((slice,last)) => if let Some(image) = decoder.slice(&hevc, slice, last) { return image; }
         std::ops::GeneratorState::Complete(()) => unimplemented!(),
     }}), &mut |_| Ok(true))
 }
