@@ -3,7 +3,7 @@ pub fn from_iter<T, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] {
 pub fn list<T>(iter: impl std::iter::IntoIterator<Item=T>) -> Box<[T]> { iter.into_iter().collect() }
 pub fn sort_by<T>(mut s: Box<[T]>, f: impl Fn(&T,&T)->std::cmp::Ordering) -> Box<[T]> { s.sort_by(f); s }
 pub fn map<T,U>(iter: impl std::iter::IntoIterator<Item=T>, f: impl Fn(T)->U) -> Box<[U]> { list(iter.into_iter().map(f)) }
-pub fn bytes_of<T>(value: &T) -> &[u8] { unsafe{std::slice::from_raw_parts(value as *const _ as *const u8, std::mem::size_of::<T>())} }
+pub fn bytes_of<T>(value: &T) -> &[u8] { unsafe{std::slice::from_raw_parts((&raw const *value).cast(), std::mem::size_of::<T>())} }
 
 pub mod va {
     #![allow(dead_code,non_camel_case_types,non_upper_case_globals,improper_ctypes,non_snake_case)]
@@ -29,7 +29,8 @@ pub struct Decoder<'t> {
     config: va::VAConfigID,
     sequence: Option<Sequence>,
 }
-pub struct DMABuf {pub format: u32, pub fd: std::os::fd::OwnedFd, pub modifiers: u64}
+use vector::{size, xy};
+pub struct DMABuf {pub format: u32, pub fd: std::os::fd::OwnedFd, pub modifiers: u64, pub size: size}
 
 use crate::video::*;
 impl<'t> Decoder<'t> {
@@ -39,13 +40,15 @@ impl<'t> Decoder<'t> {
         let va = unsafe{va::vaGetDisplayDRM(device.as_raw_fd())};
         extern "C" fn error(_user_context: *mut std::ffi::c_void, message: *const std::ffi::c_char) { panic!("{:?}", unsafe{std::ffi::CStr::from_ptr(message)}) }
         unsafe{va::vaSetErrorCallback(va, Some(error), std::ptr::null_mut())};
-        extern "C" fn info(_user_context: *mut std::ffi::c_void, _message: *const std::ffi::c_char) { /*println!("{:?}", unsafe{std::ffi::CStr::from_ptr(_message)});*/ }
+        extern "C" fn info(_user_context: *mut std::ffi::c_void, _message: *const std::ffi::c_char) { if false { println!("{:?}", unsafe{std::ffi::CStr::from_ptr(_message)}); } }
         unsafe{va::vaSetInfoCallback(va,  Some(info),  std::ptr::null_mut())};
         let (mut major, mut minor) = (0,0);
         check(unsafe{va::vaInitialize(va, &mut major, &mut minor)});
         let mut config = 0;
-        //check(unsafe{va::vaCreateConfig(va, va::VAProfile_VAProfileHEVCMain10, va::VAEntrypoint_VAEntrypointVLD, &[va::VAConfigAttrib{type_: va::VAConfigAttribType_VAConfigAttribDecProcessing, value: va::VA_DEC_PROCESSING}] as *const _ as *mut _, 1, &mut config)});
-        check(unsafe{va::vaCreateConfig(va, va::VAProfile_VAProfileHEVCMain10, va::VAEntrypoint_VAEntrypointVLD, std::ptr::null_mut(), 0, &mut config)});
+        check(unsafe{va::vaCreateConfig(va, va::VAProfile_VAProfileHEVCMain10, va::VAEntrypoint_VAEntrypointVLD,
+            //[va::VAConfigAttrib{type_: va::VAConfigAttribType_VAConfigAttribDecProcessing, value: va::VA_DEC_PROCESSING}].as_ptr().cast_mut(), 1
+            std::ptr::null_mut(), 0,
+            &mut config)});
         Self{device, va, config, sequence: None}
     }
 	pub fn slice(&mut self, hevc: &HEVC, Slice{pps, unit, escaped_data,slice_data_byte_offset,dependent_slice_segment,slice_segment_address}: Slice, last_slice_of_picture: bool) -> Option<DMABuf> {
@@ -57,7 +60,7 @@ impl<'t> Decoder<'t> {
             let mut ids = [0; _];
             check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_YUV420_10, sps.width as _, sps.height as _, ids.as_mut_ptr(), ids.len() as _, std::ptr::null_mut(), 0)});
             let mut context = 0;
-            check(unsafe{va::vaCreateContext(va, self.config, sps.width as _, sps.height as _, va::VA_PROGRESSIVE as _, ids.as_ptr() as *mut _, ids.len() as _, &mut context)});
+            check(unsafe{va::vaCreateContext(va, self.config, sps.width as _, sps.height as _, va::VA_PROGRESSIVE as _, ids.as_ptr().cast_mut(), ids.len() as _, &mut context)});
             Sequence{frames: ids.map(|id| Frame{id, poc: None}), context, next_poc: 0, decode_frame_id: None, buffers: Vec::new(), rgb: None}
         });
         let frames = &mut sequence.frames;
@@ -65,7 +68,7 @@ impl<'t> Decoder<'t> {
 
         let mut render = {let context = sequence.context; let buffers = &mut sequence.buffers; move |r#type, data:&[u8]| {
             let mut buffer = 0;
-            check(unsafe{va::vaCreateBuffer(va, context, r#type, data.len() as _, 1, data.as_ptr() as *const _ as *mut _, &mut buffer)});
+            check(unsafe{va::vaCreateBuffer(va, context, r#type, data.len() as _, 1, data.as_ptr().cast::<std::ffi::c_void>().cast_mut(), &mut buffer)});
             buffers.push(buffer);
         }};
 
@@ -269,43 +272,48 @@ impl<'t> Decoder<'t> {
         last_slice_of_picture.then(|| {
             let context = sequence.context;
             check(unsafe{va::vaBeginPicture(va, context, decode_frame_id)});
-            check(unsafe{va::vaRenderPicture(va, context, sequence.buffers.as_ptr() as *const _ as *mut _, sequence.buffers.len() as _)}); sequence.buffers.clear();
+            check(unsafe{va::vaRenderPicture(va, context, sequence.buffers.as_ptr().cast_mut(), sequence.buffers.len() as _)}); sequence.buffers.clear();
             check(unsafe{va::vaEndPicture(va, context)});
-            check(unsafe{va::vaSyncSurface(va, decode_frame_id)});
             sequence.decode_frame_id = None; // Signals that next slice is a new picture
             sequence.frames.iter().find_map(|&Frame{poc,id}| (poc? == sequence.next_poc).then(|| {
                 sequence.next_poc += 1;
-                let size = vector::xy{x: sps.width as u32, y: sps.height as u32};
+                let size = xy{x: sps.width as u32, y: sps.height as u32};
                 let rgb = *sequence.rgb.get_or_insert_with(|| {
                     let mut rgb = va::VA_INVALID_SURFACE;
-                    check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_RGB32/*VA_RT_FORMAT_YUV420_10*/, sps.width as _, sps.height as _, &mut rgb as *mut _, 1, std::ptr::null_mut(), 0)});
+                    check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_RGB32/*VA_RT_FORMAT_YUV420_10*/, sps.width as _, sps.height as _, &mut rgb, 1, std::ptr::null_mut(), 0)});
                     rgb
                 });
+                check(unsafe{va::vaSyncSurface(va, id)});
                 if false {
                     let mut config = 0;
                     check(unsafe{va::vaCreateConfig(va, va::VAProfile_VAProfileNone, va::VAEntrypoint_VAEntrypointVideoProc, std::ptr::null_mut(), 0, &mut config)});
                     let mut context = 0;
-                    check(unsafe{va::vaCreateContext(va, config, sps.width as _, sps.height as _, va::VA_PROGRESSIVE as _, [id, rgb].as_ptr() as *mut _, 2, &mut context)});
+                    //check(unsafe{va::vaCreateContext(va, config, sps.width as _, sps.height as _, va::VA_PROGRESSIVE as _, [id, rgb].as_ptr().cast_mut(), 2, &mut context)});
+                    check(unsafe{va::vaCreateContext(va, 0, 0, 0, 0, std::ptr::null_mut(), 0, &mut context)});
+                    //check(unsafe{va::DdiVp_CreateContext(ctx, 0, 0, 0, 0, 0, 0, &mut context)});
+                    let pipeline_parameter_buffer = va::VAProcPipelineParameterBuffer{surface: id, ..Default::default()};
                     let mut pipeline = va::VA_INVALID_ID;
-                    check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VAProcPipelineParameterBufferType, std::mem::size_of::<va::VAProcPipelineParameterBuffer>() as _, 1, &va::VAProcPipelineParameterBuffer{surface: id, ..Default::default() } as *const _ as *mut _, &mut pipeline as *mut _)});
+                    check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VAProcPipelineParameterBufferType, std::mem::size_of::<va::VAProcPipelineParameterBuffer>() as _, 1, (&raw const pipeline_parameter_buffer).cast::<std::ffi::c_void>().cast_mut(), &mut pipeline)});
                     check(unsafe{va::vaBeginPicture(va, context, rgb)});
-                    check(unsafe{va::vaRenderPicture(va, context, &pipeline as *const _ as *mut _, 1)});
+                    check(unsafe{va::vaRenderPicture(va, context, (&raw const pipeline).cast_mut(), 1)});
                     check(unsafe{va::vaEndPicture(va, context)});
                 } else {
-                    let ref format = va::VAImageFormat{fourcc: va::VA_FOURCC_ARGB, byte_order: va::VA_LSB_FIRST, bits_per_pixel: 24, depth: 0, red_mask: 0, green_mask: 0, blue_mask: 0, alpha_mask: 0, va_reserved: [0; _]};
+                    let format = va::VAImageFormat{fourcc: va::VA_FOURCC_ARGB, byte_order: va::VA_LSB_FIRST, bits_per_pixel: 24, depth: 0, red_mask: 0, green_mask: 0, blue_mask: 0, alpha_mask: 0, va_reserved: [0; _]};
                     let mut image = va::VAImage{image_id: va::VA_INVALID_ID, ..Default::default()};
-                    check(unsafe{va::vaCreateImage(va, format as *const _ as *mut _, sps.width as _, sps.height as _, &mut image)});
+                    check(unsafe{va::vaCreateImage(va, (&raw const format).cast_mut(), sps.width as _, sps.height as _, &mut image)});
                     check(unsafe{va::vaGetImage(va, id, 0, 0, size.x, size.y, image.image_id)});
                     check(unsafe{va::vaPutImage(va, rgb, image.image_id, 0, 0, size.x, size.y, 0, 0, size.x, size.y)});
                 }
+                check(unsafe{va::vaSyncSurface(va, rgb)});
 
                 let mut descriptor = va::VADRMPRIMESurfaceDescriptor::default();
-                check(unsafe{va::vaExportSurfaceHandle(va, rgb, va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, va::VA_EXPORT_SURFACE_READ_ONLY | va::VA_EXPORT_SURFACE_SEPARATE_LAYERS, &mut descriptor as *mut _ as *mut _)});
+                check(unsafe{va::vaExportSurfaceHandle(va, rgb, va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, va::VA_EXPORT_SURFACE_READ_ONLY | va::VA_EXPORT_SURFACE_SEPARATE_LAYERS, (&raw mut descriptor).cast::<std::ffi::c_void>())});
                 let dmabuf = descriptor.objects[0];
                 DMABuf{
                     format: {assert!(descriptor.fourcc == va::VA_FOURCC_ARGB); u32::from_le_bytes("XR24".as_bytes().try_into().unwrap())},
                     fd: unsafe{std::os::unix::io::FromRawFd::from_raw_fd(dmabuf.fd)},
-                    modifiers: dmabuf.drm_format_modifier
+                    modifiers: dmabuf.drm_format_modifier,
+                    size
                 }
             }))
         }).flatten()
