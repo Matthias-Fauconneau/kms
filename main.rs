@@ -19,9 +19,16 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = unsafe{memmap::Mmap::map(&std::fs::File::open(&path)?)}?;
     let (mut matroska, mut hevc) = video::matroska(&*input).unwrap();
     let device = ui::Device::new("/dev/dri/renderD128");
-    let mut decoder = va::Decoder::new(&device);
-    ui::run(&mut Player(move || loop { match std::ops::Generator::resume(std::pin::Pin::new(&mut matroska), &mut hevc) {
-        std::ops::GeneratorState::Yielded((slice,last)) => if let Some(image) = decoder.slice(&hevc, slice, last) { return image; }
+    let ref mut decoder = va::Decoder::new(&device);
+    let mut counter = 0;
+    let mut slice = move |decoder:&mut va::Decoder| match std::ops::Generator::resume(std::pin::Pin::new(&mut matroska), &mut hevc) {
+        std::ops::GeneratorState::Yielded((slice,last)) => decoder.slice(&hevc, slice, last),
         std::ops::GeneratorState::Complete(()) => unimplemented!(),
-    }}), &mut |_| Ok(true))
+    };
+    let mut decoder = move || loop {
+        while decoder.sequence.as_ref().filter(|s| s.decode_frame_id.is_some()).is_some() { slice(decoder); }
+        while let Some(image) = decoder.next() { println!("{counter}"); counter += 1; return image; }
+        slice(decoder);
+    };
+    ui::run(&mut Player(&mut decoder), &mut |_| Ok(true))
 }
