@@ -7,7 +7,7 @@ fn array<T: Default, const N: usize>(len: usize, mut f: impl FnMut()->T) -> [T; 
 mod video;
 
 struct Card(std::fs::File);
-impl Card { fn new() -> Self { Self(std::fs::OpenOptions::new().read(true).write(true).open("/dev/dri/card0").unwrap()) } }
+impl Card { pub fn new() -> Self { Self(std::fs::OpenOptions::new().read(true).write(true).open("/dev/dri/card0").unwrap()) } }
 impl std::os::fd::AsFd for Card { fn as_fd(&self) -> std::os::fd::BorrowedFd { self.0.as_fd() } }
 impl std::os::fd::AsRawFd for Card { fn as_raw_fd(&self) -> std::os::fd::RawFd { self.0.as_raw_fd() } }
 use drm::Device;
@@ -24,7 +24,8 @@ impl<T: FnMut()->va::Image<'static>> ui::Widget for Player<T> { fn paint(&mut se
 } }
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let input = unsafe{memmap::Mmap::map(&std::fs::File::open(&std::env::args().skip(1).next().unwrap_or(std::env::var("HOME")?+"/input.mkv"))?)}?;
+    let path = std::env::args().skip(1).next().unwrap_or(std::env::var("HOME")?+"/input.mkv");
+    let input = unsafe{memmap::Mmap::map(&std::fs::File::open(&path)?)}?;
     let (mut matroska, mut hevc) = video::matroska(&*input).unwrap();
     let card = Card::new();
     let mut decoder = va::Decoder::new(&card);

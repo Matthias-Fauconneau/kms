@@ -21,3 +21,6 @@ nix='*'
 vector={git='https://github.com/Matthias-Fauconneau/vector'}
 image={git='https://github.com/Matthias-Fauconneau/image'}
 ui={git='https://github.com/Matthias-Fauconneau/ui'}
+
+[patch.'https://github.com/rust-av/matroska']
+matroska={version='*', git='https://github.com/Matthias-Fauconneau/matroska', branch='cluster'}

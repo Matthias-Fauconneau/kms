@@ -16,7 +16,7 @@ fn unit(input: &[u8]) -> nom::IResult<&[u8], &[u8]> { let (rest, length) = nom::
 
 #[path="bit.rs"] mod bit; use bit::Reader;
 
-#[derive(Clone,Copy,num_derive::FromPrimitive)] pub enum SliceType { B, P, I }
+#[derive(Clone,Copy,num_derive::FromPrimitive,Debug)] pub enum SliceType { B, P, I }
 use num_traits::FromPrimitive;
 
 fn profile_tier_level(s: &mut Reader, max_layers: usize) {
@@ -46,7 +46,6 @@ fn profile_tier_level(s: &mut Reader, max_layers: usize) {
     let _level_idc = s.u8();
     if max_layers > 1 {
         let layers : [_; 8] = std::array::from_fn(|_| (s.bit(), s.bit()));
-        //println!("{layers:?}");
         let _layers = layers.map(|(profile, level)| {
             if profile { s.skip(44); s.skip(43); }
             if level { s.u8(); }
@@ -288,10 +287,10 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 	let data = escaped_data[0..2].iter().copied().chain(escaped_data.array_windows().filter_map(|&[a,b,c]| (!(a == 0 && b== 0 && c == 3)).then(|| c))).collect::<Vec<u8>>();
 	let ref mut s = Reader::new(&data);
 	assert!(s.bit() == false); //forbidden_zero_bit
-	//let _ref_idc = s.bits(2);
-	let unit = NAL::from_u32(s.bits(/*5*/6)).unwrap();
+	let unit = NAL::from_u32(s.bits(6)).unwrap();
 	let temporal_id = if !matches!(unit, NAL::EOS_NUT|NAL::EOB_NUT) {
-		let _layer_id = s.bits(6);
+		let layer_id = s.bits(6);
+		assert!(layer_id == 0);
 		s.bits(3) - 1
 	} else { 0 };
 	match unit {
@@ -314,7 +313,6 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 			const CONTENT_LIGHT_LEVEL_INFO : u8 = 144;
 			let sei_type = s.u8();
 			let _size = decode(s);
-			//println!("{sei_type} {size} {:}", data);
 			match sei_type {
 				ACTIVE_PARAMETER_SETS => {
 					let _active_video_parameter_set_id = s.bits(4);
@@ -322,7 +320,6 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 					let _no_parameter_set_update = s.bit();
 					let _num_sps_ids = s.exp_golomb_code();
 					let _active_seq_parameter_set_id = s.ue();
-					//println!("active parameter sets: {_active_video_parameter_set_id} {_self_contained_cvs} {_no_parameter_set_update} {num_sps_ids} {active_seq_parameter_set_id}");
 				}
 				USER_DATA_UNREGISTERED => {},
 				MASTERING_DISPLAY_INFO => {},
@@ -333,9 +330,8 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 				_ => panic!("SEI {sei_type:}"),
 			}
 		}
-		NAL::AUD => {}//println!("AUD {data:?}"),
+		NAL::AUD => {}
 		NAL::VPS => {
-			//println!("VPS");
 			let id = s.bits(4) as usize;
 			assert!(id == 0);
 			assert!(s.bits(2) == 3);
@@ -406,7 +402,6 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 				}
 				sets.into_boxed_slice()
 			};
-			//println!("SPS {id} {short_term_reference_picture_sets:?}");
 			let long_term_reference_picture_set = s.bit().then(|| (0..s.ue()).map(|_| LongTermReferencePicture{poc: s.bits(log2_max_poc_lsb), used: s.bit()}).collect());
 			let temporal_motion_vector_predictor = s.bit();
 			let strong_intra_smoothing = s.bit();
@@ -463,7 +458,6 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 		},
 		NAL::PPS => {
 			let id = s.ue() as usize;
-			//println!("def PPS {id}");
 			self.pps[id] = Some(PPS{
 				sps: s.ue() as usize,
 				dependent_slice_segments: s.bit(),
@@ -512,7 +506,6 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 			});
 		}
 		NAL::IDR_W_RADL|NAL::IDR_N_LP|NAL::TRAIL_R|NAL::TRAIL_N => {
-			//println!("{unit:?}");
 			let first_slice = s.bit();
 			if Intra_Random_Access_Picture(unit) { let _no_output_of_prior_pics = s.bit(); }
 			let pps_id = s.ue() as usize;
@@ -543,7 +536,7 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 						prev_poc_msb
 					};
 					let poc = if matches!(unit, NAL::BLA_W_RADL|NAL::BLA_W_LP|NAL::BLA_N_LP) { 0 } else { poc_msb } + poc_lsb as u32;
-					//if temporal_id == 0 && !matches!(unit,NAL::TRAIL_N|NAL::TSA_N|NAL::STSA_N|NAL::RADL_N|NAL::RASL_N|NAL::RADL_R|NAL::RASL_R) { self.poc_tid0 = poc; }
+					if temporal_id == 0 && !matches!(unit,NAL::TRAIL_N|NAL::TSA_N|NAL::STSA_N|NAL::RADL_N|NAL::RASL_N|NAL::RADL_R|NAL::RASL_R) { self.poc_tid0 = poc; }
 					let (short_term_picture_set, short_term_picture_set_encoded_bits_len_skip) = if !s.bit() { let start = s.available()+1; (decode_short_term_reference_picture_set(s, &sps.short_term_reference_picture_sets, true), Some((start - s.available()) as u32)) }
 					else {
 						let set = if sps.short_term_reference_picture_sets.len()>1 { s.bits(ceil_log2(sps.short_term_reference_picture_sets.len())) as usize } else { 0 };
@@ -566,7 +559,6 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 						temporal_motion_vector_predictor: sps.temporal_motion_vector_predictor && s.bit()
 					}
 				});
-				//if temporal_id == 0 && !matches!(unit, TRAIL_N/*|TSA_N|STSA_N|RADL_N|RASL_N|RADL_R|RASL_R*/) { poc_tid0 = reference.as_ref().map(|r| r.poc).unwrap_or(0); }
 				if temporal_id == 0 && !matches!(unit, NAL::TRAIL_N|NAL::TSA_N|NAL::STSA_N|NAL::RADL_N|NAL::RASL_N|NAL::RADL_R|NAL::RASL_R) { self.poc_tid0 = reference.as_ref().map(|r| r.poc).unwrap_or(0); }
 				let chroma = sps.chroma_format_idc>0;
 				let sample_adaptive_offset = sps.sample_adaptive_offset.then(|| LumaChroma{luma: s.bit(), chroma: chroma.then(|| s.bit())}).unwrap_or(LumaChroma{luma: false, chroma: chroma.then(|| false)});
@@ -612,7 +604,6 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 			} // !dependent_slice_segment
 			let slice_data_byte_offset = (s.bits_offset() + 1 + 7) / 8; // Add 1 to the bits count here to account for the byte_alignment bit, which always is at least one bit and not accounted for otherwise
 			assert!(slice_data_byte_offset <= 36, "{slice_data_byte_offset}"); // Assumes no escape
-			//*if first_slice { picture(context.sequence.as_mut().unwrap(), pps, sps, unit, context.slice_header.as_ref().unwrap().reference.as_ref()) }
 			return Some(Slice{pps: pps_id, unit, escaped_data, slice_data_byte_offset, dependent_slice_segment, slice_segment_address});
 		}
 		_ => unimplemented!(),
@@ -622,7 +613,7 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 
 use nom::combinator::ParserIterator;
 type Segments<'t> = ParserIterator<&'t [u8], matroska::ebml::Error<'t>, for<'a> fn(&'a [u8])->nom::IResult<&'a [u8], matroska::elements::SegmentElement<'a>, matroska::ebml::Error<'a>>>;
-type Blocks<'t> = std::vec::IntoIter<&'t [u8]>;
+type Blocks<'t> = std::vec::IntoIter<matroska::elements::BlockGroup<'t>>;
 type Units<'t> = ParserIterator<&'t [u8], nom::error::Error<&'t [u8]>, for<'a> fn(&'a [u8])->nom::IResult<&'a [u8], &'a [u8], nom::error::Error<&'a [u8]>>>;
 pub struct State<'t> {video_track_number: u64, segments: Segments<'t>}
 pub enum Matroska<'t> {
@@ -655,7 +646,8 @@ pub fn matroska<'t>(input: &'t [u8]) -> Result<(Matroska<'t>, HEVC), nom::Err<ma
 	}}
 	let video_track_number = video.track_number;
 	let segments = iterator(input, matroska::elements::segment_element as _);
-	/*let slices = crate::lending::from_generator({move || {let mut input = input; for element in &mut input { use matroska::elements::SegmentElement::*; match element {
+
+	/*Ok(move || {let mut segments = segments; for element in &mut segments { use matroska::elements::SegmentElement::*; match element {
 		Void(_) => {},
 		Cluster(cluster) => for data_block in cluster.simple_block {
 			let (data, block) = matroska::elements::simple_block(data_block).unwrap();
@@ -671,7 +663,7 @@ pub fn matroska<'t>(input: &'t [u8]) -> Result<(Matroska<'t>, HEVC), nom::Err<ma
 		Cues(_) => {},
 		Chapters(_) => {},
 		_ => panic!("{element:?}")
-}}}*/
+	}}})*/
 	use std::ops::GeneratorState as YieldedComplete;
 	impl<'t> std::ops::Generator<&mut HEVC> for Matroska<'t> {
 		type Yield = (Slice<'t>, bool);
@@ -680,14 +672,14 @@ pub fn matroska<'t>(input: &'t [u8]) -> Result<(Matroska<'t>, HEVC), nom::Err<ma
 			type YieldedComplete0<'t> = YieldedComplete<(Slice<'t>, bool), ()>;
 			use Matroska::*;
 			fn segments<'t: 'y, 's: 'y, 'y>(hevc: &mut HEVC, mut state: State<'t>) -> (Matroska<'t>, YieldedComplete0<'y>) {
-				while let Some(element) = (&mut state.segments).next() { use matroska::elements::SegmentElement::*; match element {
+				while let Some(segment) = (&mut state.segments).next() { use matroska::elements::SegmentElement::*; match segment {
 					Void(_) => {},
 					Cluster(cluster) => {
-						let mut blocks = cluster.simple_block.into_iter();
-						while let Some(block) = blocks.next() {
-							let (data, block) = matroska::elements::simple_block(block).unwrap();
-							if block.track_number == state.video_track_number {
-								let mut units = iterator(data, unit as _);
+						let mut blocks = cluster.block.into_iter();
+						while let Some(matroska::elements::BlockGroup{block,..}) = blocks.next() {
+							let (block, matroska::elements::SimpleBlock{track_number,..}) = matroska::elements::simple_block(block).unwrap();
+							if track_number == state.video_track_number {
+								let mut units = iterator(block, unit as _);
 								while let Some(unit) = (&mut units).next() {
 									if let Some(slice) = hevc.unit(unit) {
 										return if let Some(unit) = (&mut units).next() {
@@ -702,7 +694,7 @@ pub fn matroska<'t>(input: &'t [u8]) -> Result<(Matroska<'t>, HEVC), nom::Err<ma
 					}
 					Cues(_) => {},
 					Chapters(_) => {},
-					_ => panic!("{element:?}")
+					_ => unreachable!()
 				}}
 				(Done, YieldedComplete::Complete(()))
 			}
@@ -717,10 +709,10 @@ pub fn matroska<'t>(input: &'t [u8]) -> Result<(Matroska<'t>, HEVC), nom::Err<ma
 					}
 				},
 				Point2(state, mut blocks) => '_yield: {
-					while let Some(data_block) = blocks.next() {
-						let (data, block) = matroska::elements::simple_block(data_block).unwrap();
-						if block.track_number == state.video_track_number {
-							let mut units = iterator(data, self::unit as _);
+					while let Some(matroska::elements::BlockGroup{block,..}) = blocks.next() {
+						let (block, matroska::elements::SimpleBlock{track_number,..}) = matroska::elements::simple_block(block).unwrap();
+						if track_number == state.video_track_number {
+							let mut units = iterator(block, self::unit as _);
 							while let Some(unit) = (&mut units).next() {
 								if let Some(slice) = hevc.unit(unit) {
 									break '_yield if let Some(unit) = (&mut units).next() {
@@ -742,43 +734,3 @@ pub fn matroska<'t>(input: &'t [u8]) -> Result<(Matroska<'t>, HEVC), nom::Err<ma
 	}
 	Ok((Matroska::Point0(State{video_track_number, segments}), hevc))
 }
-
-/*use std::ops::ControlFlow;
-pub trait IteratorRef: Sized {
-    type Ref;
-	type Item;
-    fn next</*'s: 't,*/ 't, B, F: FnMut(&'t Self::Ref, Self::Item) -> B>(&/*'s*/ mut self, f: F) -> ControlFlow<(), B> where Self::Ref: 't;
-    fn filter_map<'t, B, F: FnMut(&'t Self::Ref, Self::Item) -> Option<B>>(self, f: F) -> FilterMap<'t, Self, F> where Self::Ref: 't { FilterMap{iter: self, f, _marker: std::marker::PhantomData} }
-}
-pub struct FilterMap<'t, I,F>{iter: I, f: F, _marker: std::marker::PhantomData<&'t ()>}
-
-/*pub trait Iterator<'t> {
-	type Item;
-    fn next<'s: 't>(&'s mut self) -> Option<Self::Item>;
-}*/
-
-impl<'t, I: IteratorRef, B, F: FnMut(&'t I::Ref, I::Item) -> Option<B>> Iterator/*<'t>*/ for FilterMap<'t, I, F> where I::Ref: 't {
-    type Item = B;
-    //fn next<'s: 't>(&'s mut self) -> Option<Self::Item> {
-	fn next(&mut self) -> Option<Self::Item> {
-		while let ControlFlow::Continue(x) = self.iter.next(&mut self.f) {
-			if let Some(x) = x { return Some(x); }
-		}
-		None
-	}
-}
-
-pub struct FromGenerator<G>(G);
-use std::ops::{Generator, GeneratorState};
-impl<R, Y, G: for<'r> Generator<&'r mut R, Return=(), Yield=Y> + Unpin> IteratorRef for FromGenerator<(G, R)> {
-    type Ref = R;
-	type Item = Y;
-    fn next</*'s:'t,*/ 't, B, F: FnMut(&'t Self::Ref, Self::Item) -> B>(&/*'s*/ mut self, mut f: F) -> ControlFlow<(), B> where Self::Ref: 't {
-		match std::pin::Pin::new(&mut self.0.0).resume(&mut self.0.1) {
-			GeneratorState::Yielded(n) => ControlFlow::Continue(f(&self.0.1, n)),
-			GeneratorState::Complete(()) => ControlFlow::Break(()),
-		}
-	}
-}
-pub fn from_generator<G>(generator: G) -> FromGenerator<G> { FromGenerator(generator) }*/
-
