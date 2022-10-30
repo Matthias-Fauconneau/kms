@@ -24,3 +24,6 @@ ui={git='https://github.com/Matthias-Fauconneau/ui'}
 
 [patch.'https://github.com/rust-av/matroska']
 matroska={version='*', git='https://github.com/Matthias-Fauconneau/matroska', branch='cluster'}
+
+[patch.'https://github.com/Matthias-Fauconneau/ui']
+ui={path='../ui'}
