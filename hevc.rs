@@ -2,8 +2,6 @@
 use crate::array;
 fn ceil_log2(x: usize) -> u8 { ((x-1)<<1).ilog2() as u8 }
 
-fn unit(input: &[u8]) -> nom::IResult<&[u8], &[u8]> { let (rest, length) = nom::number::complete::be_u32(input)?; let length = length as usize; Ok((&rest[length..], &rest[..length])) }
-
 #[allow(non_camel_case_types)] #[repr(u8)] #[derive(Clone,Copy,num_derive::FromPrimitive,Debug)] pub enum NAL {
     TRAIL_N, TRAIL_R, TSA_N, TSA_R, STSA_N, STSA_R, RADL_N, RADL_R, RASL_N, RASL_R,
     BLA_W_LP/*Leading Picture*/ = 16, BLA_W_RADL/*Random Access Decodable Leading*/, BLA_N_LP, IDR_W_RADL, IDR_N_LP, CRA_NUT,
@@ -30,18 +28,6 @@ fn profile_tier_level(s: &mut Reader, max_layers: usize) {
     let _interlaced_source = s.bit();
     let _non_packed_constraint = s.bit();
     let _frame_only_constraint = s.bit();
-    /*let check_profile = |id: u8| -> bool { profile == id || profile_compatibility&(1<<(31-id)) != 0 };
-    if (check_profile(4) || check_profile(5) || check_profile(6) || check_profile(7) || check_profile(8) || check_profile(9) || check_profile(10)) {
-        let _max_12bit = s.bit();
-        let _max_10bit = s.bit();
-        let _max_8bit = s.bit();
-        let _max_422chroma = s.bit();
-        let _max_420chroma = s.bit();
-        let _max_monochrome = s.bit();
-        let _intra = s.bit();
-        let _one_picture_only = s.bit();
-        let _lower_bit_rate = s.bit();
-        s.bits(34);*/
     s.skip(44);
     let _level_idc = s.u8();
     if max_layers > 1 {
@@ -272,6 +258,7 @@ pub struct HEVC {
 	pub slice_header: Option<SliceHeader>,
 	poc_tid0: u32,
 }
+impl HEVC { pub fn new() -> Self { HEVC{vps: Default::default(), sps: Default::default(), pps: [();_].map(|_|None), slice_header: None, poc_tid0: 0} } }
 
 pub struct Slice<'t> {
 	pub pps: usize,
@@ -282,8 +269,9 @@ pub struct Slice<'t> {
 	pub slice_segment_address: Option<usize>,
 }
 
-impl HEVC {
-fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
+impl crate::Video for HEVC {
+	type Slice<'t> = Slice<'t>;
+fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Self::Slice<'t>> {
 	let data = escaped_data[0..2].iter().copied().chain(escaped_data.array_windows().filter_map(|&[a,b,c]| (!(a == 0 && b== 0 && c == 3)).then(|| c))).collect::<Vec<u8>>();
 	let ref mut s = Reader::new(&data);
 	assert!(s.bit() == false); //forbidden_zero_bit
@@ -610,127 +598,3 @@ fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Slice<'t>> {
 	}
 	None
 }}
-
-use nom::combinator::ParserIterator;
-type Segments<'t> = ParserIterator<&'t [u8], matroska::ebml::Error<'t>, for<'a> fn(&'a [u8])->nom::IResult<&'a [u8], matroska::elements::SegmentElement<'a>, matroska::ebml::Error<'a>>>;
-type Blocks<'t> = std::vec::IntoIter<matroska::elements::BlockGroup<'t>>;
-type Units<'t> = ParserIterator<&'t [u8], nom::error::Error<&'t [u8]>, for<'a> fn(&'a [u8])->nom::IResult<&'a [u8], &'a [u8], nom::error::Error<&'a [u8]>>>;
-pub struct State<'t> {video_track_number: u64, segments: Segments<'t>}
-pub enum Matroska<'t> {
-	Point0(State<'t>),
-	Point1(State<'t>, Blocks<'t>, Units<'t>, &'t [u8]),
-	Point2(State<'t>, Blocks<'t>),
-	Done,
-}
-
-pub fn matroska<'t>(input: &'t [u8]) -> Result<(Matroska<'t>, HEVC), nom::Err<matroska::ebml::Error>> {
-	use nom::combinator::iterator;
-	let mut demuxer = matroska::demuxer::MkvDemuxer::new();
-    let (input, ()) = demuxer.parse_until_tracks(input)?;
-    let tracks = demuxer.tracks.unwrap();
-    let video = &tracks.tracks[0];
-    assert!(video.codec_id == "V_MPEGH/ISO/HEVC");
-	let mut hevc = HEVC{vps: Default::default(), sps: Default::default(), pps: [();_].map(|_|None), slice_header: None, poc_tid0: 0};
-	let s = &video.codec_private.as_ref().unwrap()[22..];
-	let (&count, mut s) = s.split_first().unwrap();
-	for _ in 0..count { s = {
-		let (_, s) = s.split_first().unwrap();
-		let (count, s) = {let (v, s) = s.split_at(2); (u16::from_be(unsafe{*(v as *const _ as *const u16)}), s)};
-		let mut s = s; for _ in 0..count { s = {
-			let (length, s) = {let (v, s) = s.split_at(2); (u16::from_be(unsafe{*(v as *const _ as *const u16)}), s)};
-			let (unit, s) = s.split_at(length as usize);
-			assert!(hevc.unit(unit).is_none());
-			s
-		}}
-		s
-	}}
-	let video_track_number = video.track_number;
-	let segments = iterator(input, matroska::elements::segment_element as _);
-
-	/*Ok(move || {let mut segments = segments; for element in &mut segments { use matroska::elements::SegmentElement::*; match element {
-		Void(_) => {},
-		Cluster(cluster) => for data_block in cluster.simple_block {
-			let (data, block) = matroska::elements::simple_block(data_block).unwrap();
-			if block.track_number == video_track_number {
-				let mut slice = None;
-				for unit in &mut iterator(data, unit) {
-					if let Some(slice) = slice.take() { yield (slice, false); }
-					slice = hevc.unit(unit);
-				}
-				yield (slice.take().unwrap(), true);
-			}
-		},
-		Cues(_) => {},
-		Chapters(_) => {},
-		_ => panic!("{element:?}")
-	}}})*/
-	use std::ops::GeneratorState as YieldedComplete;
-	impl<'t> std::ops::Generator<&mut HEVC> for Matroska<'t> {
-		type Yield = (Slice<'t>, bool);
-		type Return = ();
-		fn resume(mut self: std::pin::Pin<&mut Self>, hevc: &mut HEVC) -> YieldedComplete<Self::Yield, Self::Return> {
-			type YieldedComplete0<'t> = YieldedComplete<(Slice<'t>, bool), ()>;
-			use Matroska::*;
-			fn segments<'t: 'y, 's: 'y, 'y>(hevc: &mut HEVC, mut state: State<'t>) -> (Matroska<'t>, YieldedComplete0<'y>) {
-				while let Some(segment) = (&mut state.segments).next() { use matroska::elements::SegmentElement::*; match segment {
-					Void(_) => {},
-					Cluster(cluster) => {
-						let mut blocks = cluster.block.into_iter();
-						while let Some(matroska::elements::BlockGroup{block,..}) = blocks.next() {
-							let (block, matroska::elements::SimpleBlock{track_number,..}) = matroska::elements::simple_block(block).unwrap();
-							if track_number == state.video_track_number {
-								let mut units = iterator(block, unit as _);
-								while let Some(unit) = (&mut units).next() {
-									if let Some(slice) = hevc.unit(unit) {
-										return if let Some(unit) = (&mut units).next() {
-											(Point1(state, blocks, units, unit), YieldedComplete::Yielded((slice, false)))
-										} else {
-											(Point2(state, blocks), YieldedComplete::Yielded((slice, true)))
-										}
-									}
-								}
-							}
-						}
-					}
-					Cues(_) => {},
-					Chapters(_) => {},
-					_ => unreachable!()
-				}}
-				(Done, YieldedComplete::Complete(()))
-			}
-			let (point, yielded_complete) = match std::mem::replace(&mut *self, Done) {
-				Point0(state) => segments(hevc, state),
-				Point1(state, blocks, mut units, unit) => {
-					let Some(slice) = hevc.unit(unit) else {unreachable!()};
-					if let Some(unit) = (&mut units).next() {
-						(Point1(state, blocks, units, unit), YieldedComplete::Yielded((slice, false)))
-					} else {
-						(Point2(state, blocks), YieldedComplete::Yielded((slice, true)))
-					}
-				},
-				Point2(state, mut blocks) => '_yield: {
-					while let Some(matroska::elements::BlockGroup{block,..}) = blocks.next() {
-						let (block, matroska::elements::SimpleBlock{track_number,..}) = matroska::elements::simple_block(block).unwrap();
-						if track_number == state.video_track_number {
-							let mut units = iterator(block, self::unit as _);
-							while let Some(unit) = (&mut units).next() {
-								if let Some(slice) = hevc.unit(unit) {
-									break '_yield if let Some(unit) = (&mut units).next() {
-										(Point1(state, blocks, units, unit), YieldedComplete::Yielded((slice, false)))
-									} else {
-										(Point2(state, blocks), YieldedComplete::Yielded((slice, false)))
-									}
-								}
-							}
-						}
-					}
-					segments(hevc, state)
-				},
-				Done => unreachable!()
-			};
-			*self = point;
-			yielded_complete
-		}
-	}
-	Ok((Matroska::Point0(State{video_track_number, segments}), hevc))
-}

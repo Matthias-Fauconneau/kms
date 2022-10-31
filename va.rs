@@ -34,7 +34,7 @@ pub struct Decoder<'t> {
 use vector::{size, xy};
 pub struct DMABuf {pub format: u32, pub fd: std::os::fd::OwnedFd, pub modifiers: u64, pub size: size}//pub type DMABuf = ();
 
-use crate::video::*;
+use crate::hevc::*;
 impl<'t> Decoder<'t> {
     pub fn new(device: &'t impl std::os::fd::AsFd) -> Self {
         let device = device.as_fd();
