@@ -258,7 +258,7 @@ pub struct HEVC {
 	pub slice_header: Option<SliceHeader>,
 	poc_tid0: u32,
 }
-impl HEVC { pub fn new() -> Self { HEVC{vps: Default::default(), sps: Default::default(), pps: [();_].map(|_|None), slice_header: None, poc_tid0: 0} } }
+impl HEVC { pub fn new() -> Self { Self{vps: Default::default(), sps: Default::default(), pps: [();_].map(|_|None), slice_header: None, poc_tid0: 0} } }
 
 pub struct Slice<'t> {
 	pub pps: usize,
@@ -269,9 +269,9 @@ pub struct Slice<'t> {
 	pub slice_segment_address: Option<usize>,
 }
 
-impl crate::Video for HEVC {
-	type Slice<'t> = Slice<'t>;
-fn unit<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Self::Slice<'t>> {
+impl crate::Decoder for HEVC {
+	type Output<'t> = Slice<'t>;
+fn decode<'t>(&mut self, escaped_data: &'t [u8]) -> Option<Self::Output<'t>> {
 	let data = escaped_data[0..2].iter().copied().chain(escaped_data.array_windows().filter_map(|&[a,b,c]| (!(a == 0 && b== 0 && c == 3)).then(|| c))).collect::<Vec<u8>>();
 	let ref mut s = Reader::new(&data);
 	assert!(s.bit() == false); //forbidden_zero_bit
