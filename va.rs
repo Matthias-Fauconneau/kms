@@ -290,10 +290,10 @@ impl<'t> Decoder<'t> {
             let size = sequence.size;
             let rgb = *sequence.rgb.get_or_insert_with(|| {
                 let mut rgb = va::VA_INVALID_SURFACE;
-                check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_RGB32, size.x, size.y, &mut rgb, 1, std::ptr::null_mut(), 0)});
+                check(unsafe{va::vaCreateSurfaces(va, va::VA_RT_FORMAT_RGB32_10, size.x, size.y, &mut rgb, 1, std::ptr::null_mut(), 0)});
                 rgb
             });
-            if true {
+            {
                 let context = *sequence.video_processing.get_or_insert_with(|| {
                     let mut config = va::VA_INVALID_ID;
                     check(unsafe{va::vaCreateConfig(va, va::VAProfile_VAProfileNone, va::VAEntrypoint_VAEntrypointVideoProc, std::ptr::null_mut(), 0, &mut config)});
@@ -307,40 +307,6 @@ impl<'t> Decoder<'t> {
                 check(unsafe{va::vaCreateBuffer(va, context, va::VABufferType_VAProcPipelineParameterBufferType, std::mem::size_of::<va::VAProcPipelineParameterBuffer>() as _, 1, (&raw const pipeline_parameter_buffer).cast::<std::ffi::c_void>().cast_mut(), &mut pipeline)});
                 check(unsafe{va::vaRenderPicture(va, context, [pipeline].as_ptr().cast_mut(), 1)});
                 check(unsafe{va::vaEndPicture(va, context)});
-            } else if false {
-                let format = va::VAImageFormat{fourcc: va::VA_FOURCC_XRGB, byte_order: va::VA_LSB_FIRST, bits_per_pixel: 32, depth: 0, red_mask: 0, green_mask: 0, blue_mask: 0, alpha_mask: 0, va_reserved: [0; _]};
-                let mut image = va::VAImage{image_id: va::VA_INVALID_ID, ..Default::default()};
-                check(unsafe{va::vaCreateImage(va, (&raw const format).cast_mut(), size.x as _, size.y as _, &mut image)});
-                check(unsafe{va::vaGetImage(va, id, 0, 0, size.x, size.y, image.image_id)});
-                check(unsafe{va::vaPutImage(va, rgb, image.image_id, 0,0, size.x,size.y, 0,0, size.x,size.y)});
-            } else {
-                let format = va::VAImageFormat{fourcc: va::VA_FOURCC_P010, byte_order: va::VA_LSB_FIRST, bits_per_pixel: 24, depth: 0, red_mask: 0, green_mask: 0, blue_mask: 0, alpha_mask: 0, va_reserved: [0; _]};
-                let mut p010 = va::VAImage{image_id: va::VA_INVALID_ID, ..Default::default()};
-                //check(unsafe{va::vaCreateImage(va, (&raw const format).cast_mut(), size.x as _, size.y as _, &mut p010)});
-                check(unsafe{va::vaCreateImage(va, &format as *const _ as *mut _, size.x as _, size.y as _, &mut p010)});
-                check(unsafe{va::vaGetImage(va, id, 0, 0, size.x, size.y, p010.image_id)});
-                let mut address : *const u16 = std::ptr::null();
-                check(unsafe{va::vaMapBuffer(va, p010.buf, &mut address as *mut * const _ as *mut *mut _)});
-                #[allow(non_snake_case)] let Y = image::Image::new(size, unsafe{std::slice::from_raw_parts(address, (size.y*size.x) as usize)});
-                let format = va::VAImageFormat{fourcc: va::VA_FOURCC_XRGB, byte_order: va::VA_LSB_FIRST, bits_per_pixel: 32, depth: 0, red_mask: 0, green_mask: 0, blue_mask: 0, alpha_mask: 0, va_reserved: [0; _]};
-                let mut bgrx = va::VAImage{image_id: va::VA_INVALID_ID, ..Default::default()};
-                check(unsafe{va::vaCreateImage(va, (&raw const format).cast_mut(), size.x as _, size.y as _, &mut bgrx)});
-                let mut address : *mut image::bgra8 = std::ptr::null_mut();
-                //check(unsafe{va::vaMapBuffer(va, bgrx.buf, &raw mut address as *mut *mut _)});
-                check(unsafe{va::vaMapBuffer(va, bgrx.buf, &mut address as *mut *mut _ as *mut *mut _)});
-                {let mut bgrx = image::Image::new(size, unsafe{std::slice::from_raw_parts_mut(address, (size.y*size.x) as usize)});
-                    for y in 0..size.y {
-                        let row = y*size.x;
-                        for x in 0..size.x { bgrx[(row+x) as usize] = ((Y[(row+x) as usize]>>(6+2)) as u8).into(); }
-                    }
-                }
-                check(unsafe{va::vaUnmapBuffer(va, bgrx.buf)});
-                check(unsafe{va::vaUnmapBuffer(va, p010.buf)});
-                check(unsafe{va::vaPutImage(va, rgb, bgrx.image_id, 0,0, size.x,size.y, 0,0, size.x,size.y)});
-                check(unsafe{va::vaDestroyBuffer(va, p010.buf)});
-                check(unsafe{va::vaDestroyImage(va, p010.image_id)});
-                check(unsafe{va::vaDestroyBuffer(va, bgrx.buf)});
-                check(unsafe{va::vaDestroyImage(va, bgrx.image_id)});
             }
             check(unsafe{va::vaSyncSurface(va, rgb)});
 
@@ -349,7 +315,7 @@ impl<'t> Decoder<'t> {
             let dmabuf = descriptor.objects[0];
             assert!(dmabuf.drm_format_modifier == 0);
             DMABuf{
-                format: {assert!(descriptor.fourcc == va::VA_FOURCC_ARGB); u32::from_le_bytes("XR24".as_bytes().try_into().unwrap())},
+                format: descriptor.fourcc,
                 fd: unsafe{std::os::unix::io::FromRawFd::from_raw_fd(dmabuf.fd)},
                 modifiers: dmabuf.drm_format_modifier,
                 size
@@ -357,4 +323,3 @@ impl<'t> Decoder<'t> {
         })
     }
 }
-
