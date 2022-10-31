@@ -12,10 +12,10 @@ fn ceil_log2(x: usize) -> u8 { ((x-1)<<1).ilog2() as u8 }
 #[allow(non_snake_case)] pub fn Intra_Random_Access_Picture(unit: NAL) -> bool { 16 <= unit as u8 && unit as u8 <= 23 }
 #[allow(non_snake_case)] pub fn Instantaneous_Decoder_Refresh(unit: NAL) -> bool { use NAL::*; matches!(unit, IDR_W_RADL|IDR_N_LP) }
 
-#[path="bit.rs"] mod bit; use bit::Reader;
-
 #[derive(Clone,Copy,num_derive::FromPrimitive,Debug)] pub enum SliceType { B, P, I }
 use num_traits::FromPrimitive;
+
+use crate::bit::Reader;
 
 fn profile_tier_level(s: &mut Reader, max_layers: usize) {
     let _profile_space = s.bits(2);

@@ -1,10 +1,11 @@
-#![allow(incomplete_features)]#![feature(generic_arg_infer,generic_const_exprs,unchecked_math,int_log,array_windows,array_zip,array_methods,type_alias_impl_trait,generator_trait,control_flow_enum,try_trait_v2,try_blocks,closure_track_caller,raw_ref_op)]
+#![allow(incomplete_features)]#![feature(generic_arg_infer,generic_const_exprs,unchecked_math,int_log,array_windows,array_zip,array_methods,type_alias_impl_trait,generator_trait,control_flow_enum,closure_track_caller,raw_ref_op)]
 fn from_iter_or_else<T, const N: usize>(iter: impl IntoIterator<Item=T>, f: impl Fn() -> T+Copy) -> [T; N] { let mut iter = iter.into_iter(); [(); N].map(|_| iter.next().unwrap_or_else(f)) }
 pub fn from_iter<T, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] { crate::from_iter_or_else(iter, || unreachable!()) }
 fn from_iter_or_default<T: Default, const N: usize>(iter: impl IntoIterator<Item=T>) -> [T; N] { from_iter_or_else(iter, || Default::default()) }
 fn array<T: Default, const N: usize>(len: usize, mut f: impl FnMut()->T) -> [T; N] { from_iter_or_default((0..len).map(|_| f())) }
 
 mod matroska; use self::matroska::Decoder;
+pub mod bit;
 mod hevc;
 mod eac3;
 mod va;
