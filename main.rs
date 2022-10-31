@@ -20,14 +20,13 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut matroska, mut hevc) = video::matroska(&*input).unwrap();
     let device = ui::Device::new("/dev/dri/renderD128");
     let ref mut decoder = va::Decoder::new(&device);
-    let mut counter = 0;
     let mut slice = move |decoder:&mut va::Decoder| match std::ops::Generator::resume(std::pin::Pin::new(&mut matroska), &mut hevc) {
         std::ops::GeneratorState::Yielded((slice,last)) => decoder.slice(&hevc, slice, last),
         std::ops::GeneratorState::Complete(()) => unimplemented!(),
     };
     let mut decoder = move || loop {
         while decoder.sequence.as_ref().filter(|s| s.decode_frame_id.is_some()).is_some() { slice(decoder); }
-        while let Some(image) = decoder.next() { println!("{counter}"); counter += 1; return image; }
+        while let Some(image) = decoder.next() { return image; }
         slice(decoder);
     };
     ui::run(&mut Player(&mut decoder), &mut |_| Ok(true))
