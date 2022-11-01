@@ -21,11 +21,23 @@ impl<'t> Reader<'t> {
         self.word |= core::ptr::read_unaligned(self.ptr as *const u64).to_be() >> self.count;
         self.ptr = self.ptr.add(7);
         self.ptr = self.ptr.sub((self.count as usize >> 3) & 7);
-        self.count |= 56;
+        self.count |= 64-8;
     }
     fn peek(&self, count: u8) -> u32 { unsafe { self.word.unchecked_shr(64 - count as u64) as u32 } }
     #[track_caller] fn advance(&mut self, count: u8) { self.word <<= count; assert!(count <= self.count, "{count} {}", self.count); self.count -= count; }
     #[track_caller] pub fn skip(&mut self, count: u8) { if count > self.count { unsafe { self.refill(); } } self.advance(count) }
+    #[track_caller] pub fn skip_long(&mut self, count: u32) {
+        let finish_word = count.min(self.count as u32);
+        self.advance(finish_word as u8);
+        let count = count - finish_word;
+        unsafe {
+            self.ptr = self.ptr.add(count as usize/8);
+            self.word = core::ptr::read_unaligned(self.ptr as *const u64).to_be();
+            self.ptr = self.ptr.add(7);
+        }
+        self.count = 64-8;
+        self.advance(count as u8 % 8);
+    }
     #[track_caller] pub fn bits(&mut self, count: u8) -> u32 {
         if count > self.count { unsafe { self.refill(); } }
         let result = self.peek(count);

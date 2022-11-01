@@ -6,6 +6,7 @@ bindgen='*'
 cc={version='*', features=['parallel']}
 
 [dependencies]
+arrayvec='*'
 itertools='*'
 num-derive='*'
 num-traits='*'
